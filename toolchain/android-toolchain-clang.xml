@@ -53,6 +53,7 @@
   <include name="toolchain/common-defines.xml" />
   <flag value="-I${HXCPP}/include"/>
   <flag value="-Iinclude"/>
+  <flag value="--sysroot=${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/${ANDROID_HOST}/sysroot" />
   <objdir value="obj/android${OBJEXT}${ARCH}" />
   <ext value=".obj"/>
 
