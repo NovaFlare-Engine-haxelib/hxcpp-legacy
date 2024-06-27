@@ -2,7 +2,21 @@
 
 <!-- LINUX TOOLS -------------------------------------->
 
-
+<!-- <section if="HXCPP_M64">
+    <set name="CXX" value="x86_64-linux-gnu-g++" />
+    <set name="CC" value="x86_64-linux-gnu-gcc" />
+    <set name="HXCPP_STRIP" value="x86_64-linux-gnu-strip" />
+    <set name="HXCPP_AR" value="x86_64-linux-gnu-ar" />
+    <set name="HXCPP_RANLIB" value="x86_64-linux-gnu-ranlib" />
+</section>
+<section if="rpi">
+      <set name="CXX" value="arm-linux-gnueabihf-g++" />
+      <set name="CC" value="arm-linux-gnueabihf-gcc" />
+      <set name="HXCPP_STRIP" value="arm-linux-gnueabihf-strip" />
+      <set name="HXCPP_AR" value="arm-linux-gnueabihf-ar" />
+      <set name="HXCPP_RANLIB" value="arm-linux-gnueabihf-ranlib" />
+</section> -->
+   
 <section if="xcompile" >
    <section if="HXCPP_M64">
       <set name="CXX" value="${HXCPP_XLINUX64_CXX}" />
