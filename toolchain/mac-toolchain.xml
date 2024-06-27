@@ -29,7 +29,7 @@
   <cppflag value="-std=c++11" if="HXCPP_CPP11"/>
   <cppflag value="-std=c++14" if="HXCPP_CPP14"/>
   <cppflag value="-Wc++14-extensions" if="HXCPP_CPP14"/>
-  <cppflag value="-std=c++23" />
+  <cppflag value="-std=c++23" if="HXCPP_CPP23" />
   <cppflag value="-Wc++17-extensions" />
   <flag value="-stdlib=libc++" unless="STDLIBCPP" />
   <flag value="-stdlib=libstdc++" if="STDLIBCPP" />

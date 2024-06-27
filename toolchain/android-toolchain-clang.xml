@@ -1,5 +1,7 @@
 <xml>
-    
+
+<set name="HXCPP_CPP11" value="1" if="NDKV20+ || NDKV21+" unless="HXCPP_NO_CPP11" />
+
 <!-- Set architecture -->
 <section if="HXCPP_X86">
   <set name="ARCH" value="-x86" />
@@ -68,7 +70,9 @@
   <flag value="-D${ANDROID_PLATFORM_DEFINE}"/>
   
   <!-- Options -->
-  <cppflag value="-std=c++23" />
+  <cppflag value="-std=c++11" if="HXCPP_CPP11"/>
+  <flag value="-DHXCPP_CPP11" if="HXCPP_CPP11"/>
+  <cppflag value="-std=c++23" if="HXCPP_CPP23" />
   <flag value="-flto" if="HXCPP_OPTIMIZE_LINK" unless="debug"/>
   <flag value="-fvisibility=hidden"/>
   <flag value="-ffunction-sections"/>

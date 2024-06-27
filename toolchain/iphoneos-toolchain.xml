@@ -35,11 +35,11 @@
   <cppflag value="-stdlib=libstdc++" if="FORCE_LIBGCC" />
   <cppflag value="-stdlib=libc++" if="HXCPP_CPP11 || HXCPP_CPP17" />
   <cppflag value="-std=c++11" if="HXCPP_CPP11" />
-  <cppflag value="-std=c++23"  />
+  <cppflag value="-std=c++23" if="HXCPP_CPP23"  />
   <mmflag value="-stdlib=libstdc++" if="FORCE_LIBGCC" />
   <mmflag value="-stdlib=libc++" if="HXCPP_CPP11 || HXCPP_CPP17" />
   <mmflag value="-std=c++11" if="HXCPP_CPP11" />
-  <mmflag value="-std=c++23"  />
+  <mmflag value="-std=c++23" if="HXCPP_CPP23"  />
 
   <flag value="-g" if="HXCPP_DEBUG_LINK"/>
   <flag value="-O2" unless="debug"/>
