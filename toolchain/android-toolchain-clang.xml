@@ -98,6 +98,7 @@
   <flag value="--target=${ABITRIPLE}${PLATFORM_NUMBER}" />
 
   <flag value ="-static-libstdc++" />
+  <flag value ="-Wl,--allow-multiple-definition"/>
   <!-- This shows the android link line, which may be so long that it breaks the tool
      https://github.com/HaxeFoundation/hxcpp/pull/1091
      <flag value ="-v" />
