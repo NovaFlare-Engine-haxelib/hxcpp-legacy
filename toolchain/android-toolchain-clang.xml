@@ -81,6 +81,7 @@
   <flag value="-g" if="HXCPP_DEBUG_LINK"/>
   <flag value="-c"/>
   <flag value="-fpic"/>
+  <flag value="-fPIC"/>
   <flag value="-O2" unless="debug"/>
   
   <!-- Warning Supression -->
