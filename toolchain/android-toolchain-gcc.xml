@@ -80,6 +80,7 @@
   <flag value="-I${HXCPP}/include"/>
   <flag value="-Iinclude"/>
   <flag value="-fpic"/>
+  <flag value="-fPIC"/>
   <flag value="-fvisibility=hidden"/>
   <flag value="-ffunction-sections"/>
   <flag value="-funwind-tables"/>
