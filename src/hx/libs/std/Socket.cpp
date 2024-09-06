@@ -21,13 +21,8 @@
 
 
 #define DYNAMIC_INET_FUNCS 1
-#ifdef __GNUC__
-   typedef WINSOCK_API_LINKAGE __attribute__((visibility("default"))) INT (WSAAPI *inet_pton_func)( INT Family, PCSTR pszAddrString, PVOID pAddrBuf);
-   typedef WINSOCK_API_LINKAGE __attribute__((visibility("default"))) PCSTR (WSAAPI *inet_ntop_func)(INT  Family, PVOID pAddr, PSTR pStringBuf, size_t StringBufSize);
-#else
-   typedef WINSOCK_API_LINKAGE  INT (WSAAPI *inet_pton_func)( INT Family, PCSTR pszAddrString, PVOID pAddrBuf);
-   typedef WINSOCK_API_LINKAGE  PCSTR (WSAAPI *inet_ntop_func)(INT  Family, PVOID pAddr, PSTR pStringBuf, size_t StringBufSize);
-#endif
+typedef WINSOCK_API_LINKAGE  INT (WSAAPI *inet_pton_func)( INT Family, PCSTR pszAddrString, PVOID pAddrBuf);
+typedef WINSOCK_API_LINKAGE  PCSTR (WSAAPI *inet_ntop_func)(INT  Family, PVOID pAddr, PSTR pStringBuf, size_t StringBufSize);
 
 
 
