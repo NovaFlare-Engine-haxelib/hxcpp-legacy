@@ -33,6 +33,7 @@
   <flag value="-c"/>
   <cppflag value="-frtti"/>
   <flag value="-Wno-overflow" />
+  <flag value="-Wno-attributes" />
   <cppflag value="-Wno-invalid-offsetof" />
   <flag value="-g" if="HXCPP_DEBUG_LINK"/>
   <flag value="-O2" unless="debug||O3"/>
