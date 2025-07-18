@@ -194,9 +194,9 @@ static bool sGcVerifyGenerational = false;
 
 #if HX_HAS_ATOMIC && (HXCPP_GC_DEBUG_LEVEL==0) && !defined(HXCPP_GC_VERIFY) && !defined(EMSCRIPTEN)
   #if defined(HX_MACOS) || defined(HX_WINDOWS) || defined(HX_LINUX)
-  enum { MAX_GC_THREADS = 4 };
+  enum { MAX_GC_THREADS = 8 };
   #else
-  enum { MAX_GC_THREADS = 2 };
+  enum { MAX_GC_THREADS = 8 };
   #endif
 #else
   enum { MAX_GC_THREADS = 1 };
