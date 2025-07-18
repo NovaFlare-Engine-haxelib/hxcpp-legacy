@@ -199,7 +199,7 @@ static bool sGcVerifyGenerational = false;
   enum { MAX_GC_THREADS = 8 };
   #endif
 #else
-  enum { MAX_GC_THREADS = 1 };
+  enum { MAX_GC_THREADS = 8 };
 #endif
 
 #if (MAX_GC_THREADS>1)
