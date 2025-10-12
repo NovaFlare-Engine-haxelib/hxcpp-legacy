@@ -27,11 +27,11 @@ extern void __hxt_new_string(void* result, int size);
 namespace hx
 {
 #if defined(HX_MACOS) || defined(HX_WINDOWS) || defined(HX_LINUX) || defined(__ORBIS__)
-int sgMinimumWorkingMemory       = 20*1024*1024;
-int sgMinimumFreeSpace           = 10*1024*1024;
+int sgMinimumWorkingMemory       = 128*1024*1024;
+int sgMinimumFreeSpace           = 64*1024*1024;
 #else
-int sgMinimumWorkingMemory       = 8*1024*1024;
-int sgMinimumFreeSpace           = 4*1024*1024;
+int sgMinimumWorkingMemory       = 128*1024*1024;
+int sgMinimumFreeSpace           = 64*1024*1024;
 #endif
 // Once you use more than the minimum, this kicks in...
 int sgTargetFreeSpacePercentage  = 100;
