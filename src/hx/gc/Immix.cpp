@@ -7103,7 +7103,15 @@ static size_t __hxcpp_process_used_bytes()
          if (fscanf(f, "%lld %lld", &sizePages, &residentPages) == 2)
          {
             fclose(f);
-            long pageSize2 = sysconf(_SC_PAGESIZE);
+            long pageSize2 = sysconf(
+            #if defined(_SC_PAGESIZE)
+               _SC_PAGESIZE
+            #elif defined(_SC_PAGE_SIZE)
+               _SC_PAGE_SIZE
+            #else
+               -1
+            #endif
+            );
             if (pageSize2 <= 0) pageSize2 = 4096;
             return (size_t)residentPages * (size_t)pageSize2;
          }
