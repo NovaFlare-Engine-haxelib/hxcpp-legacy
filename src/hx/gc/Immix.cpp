@@ -59,6 +59,10 @@ enum { gAlwaysMove = false };
 
 #ifdef HX_WINDOWS
 #include <windows.h>
+#include <psapi.h>
+  #if defined(_MSC_VER)
+    #pragma comment(lib, "Psapi.lib")
+  #endif
 #endif
 
 #include <vector>
