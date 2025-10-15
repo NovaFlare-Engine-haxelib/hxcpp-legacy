@@ -17,6 +17,9 @@
 
 #include <string>
 #include <stdlib.h>
+#ifndef HX_WINDOWS
+#include <unistd.h>
+#endif
 
 
 static bool sgIsCollecting = false;
