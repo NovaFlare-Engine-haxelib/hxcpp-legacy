@@ -27,14 +27,14 @@ extern void __hxt_new_string(void* result, int size);
 namespace hx
 {
 #if defined(HX_MACOS) || defined(HX_WINDOWS) || defined(HX_LINUX) || defined(__ORBIS__)
-int sgMinimumWorkingMemory       = 128*1024*1024;
+int sgMinimumWorkingMemory       = 384*1024*1024;
 int sgMinimumFreeSpace           = 64*1024*1024;
 #else
 int sgMinimumWorkingMemory       = 128*1024*1024;
 int sgMinimumFreeSpace           = 64*1024*1024;
 #endif
 // Once you use more than the minimum, this kicks in...
-int sgTargetFreeSpacePercentage  = 100;
+int sgTargetFreeSpacePercentage  = 80;
 
 
 
@@ -153,6 +153,21 @@ void *NewGCPrivate(void *inData,int inSize)
 void __hxcpp_enable(bool inEnable)
 {
    hx::InternalEnableGC(inEnable);
+}
+
+static int sGcTickFrameCount = 0;
+
+void __hxcpp_gc_tick(double frameTimeLeftUs, int usedBytesThreshold, int minorEveryN)
+{
+   if (minorEveryN<=0) minorEveryN=1;
+   int used = __hxcpp_gc_used_bytes();
+   bool periodic = (sGcTickFrameCount % minorEveryN)==0;
+   bool memoryHigh = used > usedBytesThreshold;
+   if (frameTimeLeftUs > 200.0 && (memoryHigh || periodic))
+   {
+      __hxcpp_collect(false);
+   }
+   sGcTickFrameCount++;
 }
 
 void  __hxcpp_set_minimum_working_memory(int inBytes)

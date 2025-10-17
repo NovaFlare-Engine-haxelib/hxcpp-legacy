@@ -38,6 +38,7 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_enter_gc_free_zone();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_exit_gc_free_zone();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_safe_point();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_spam_collects(int inEveryNCalls);
+HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_tick(double frameTimeLeftUs, int usedBytesThreshold, int minorEveryN);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_working_memory(int inBytes);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_free_space(int inBytes);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_target_free_space_percentage(int inPercentage);
