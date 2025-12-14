@@ -146,7 +146,7 @@ static size_t sLastReservedBytes = 0;
 static hx::Object *sGcCallback = 0;
 
 static int sLargeAllocRefreshEnabled = 1;
-static bool sEnableGCLog = true;
+static bool sEnableGCLog = false;
 
 // Forward declaration needed for MaybeMinorCollect
 size_t __hxcpp_gc_garbage_estimate();
@@ -6998,7 +6998,7 @@ void InitAlloc() //inits
       if (cpuCores < 1) cpuCores = 1;
 
       int pg = ReadEnvInt("HX_GC_PARALLEL_THREADS", cpuCores);
-      int rt = ReadEnvInt("HX_GC_REFINE_THREADS", cpuCores/4 > 0 ? cpuCores/4 : 1);
+      int rt = ReadEnvInt("HX_GC_REFINE_THREADS", cpuCores/2 > 0 ? cpuCores/2 : 1);
       int mp = ReadEnvInt("HX_GC_MAX_PAUSE_MS", 1);
       int pr = ReadEnvBool("HX_GC_PARALLEL_REF_PROC", 1);
       int fs = ReadEnvBool("HX_GC_FORCE_SUSPEND", 0);
@@ -7125,7 +7125,7 @@ void *InternalNew(int inSize,bool inIsObject)
 }
 
 
-static bool sEnableGCLog = true;
+static bool sEnableGCLog = false;
 void __hxcpp_gc_enable_log(bool enable) {
     sEnableGCLog = enable;
 }
