@@ -94,9 +94,6 @@ void DebuggerTrap()
 }
 }
 
-
-
-
 static bool sgAllocInit = 0;
 static bool sgInternalEnable = true;
 static void *sgObject_root = 0;
@@ -176,7 +173,7 @@ static inline void MaybeMinorCollect()
           size_t growth = reserved - sLastReservedBytes;
           // Only skip if growth is significant (> 1MB)
           // This prevents small allocations from blocking GC, while allowing heavy loading to proceed smoothly.
-          if (growth > 1 * 1024 * 1024)
+          if (growth > 0.2 * 1024 * 1024)
           {
              if (sEnableGCLog)
              {
@@ -7002,8 +6999,8 @@ void InitAlloc() //inits
       int mp = ReadEnvInt("HX_GC_MAX_PAUSE_MS", 1);
       int pr = ReadEnvBool("HX_GC_PARALLEL_REF_PROC", 1);
       int fs = ReadEnvBool("HX_GC_FORCE_SUSPEND", 0);
-      int bd = ReadEnvInt("HX_GC_MINOR_BASE_DELTA_BYTES", 8 * 1024 * 1024);
-      int gm = ReadEnvInt("HX_GC_MINOR_GATE_MS", 500);
+      int bd = ReadEnvInt("HX_GC_MINOR_BASE_DELTA_BYTES", 10 * 1024 * 1024);
+      int gm = ReadEnvInt("HX_GC_MINOR_GATE_MS", 250);
       int sb = ReadEnvInt("HX_GC_MINOR_START_BYTES", 8*1024*1024);
       int lr = ReadEnvBool("HX_GC_LARGE_REFRESH", 0);
       hx::GCConfig cfg = hx::GetGCConfig();
