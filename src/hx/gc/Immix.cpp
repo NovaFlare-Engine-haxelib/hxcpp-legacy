@@ -173,7 +173,7 @@ static inline void MaybeMinorCollect()
           size_t growth = reserved - sLastReservedBytes;
           // Only skip if growth is significant (> 1MB)
           // This prevents small allocations from blocking GC, while allowing heavy loading to proceed smoothly.
-          if (growth > 0.2 * 1024 * 1024)
+          if (growth > 1.2 * 1024 * 1024)
           {
              if (sEnableGCLog)
              {
@@ -186,8 +186,6 @@ static inline void MaybeMinorCollect()
           // Update baseline for small growth, but proceed to check garbage
           sLastReservedBytes = reserved;
       }
-      if (reserved < sLastReservedBytes)
-          sLastReservedBytes = reserved;
 
       size_t garbageEstimate = __hxcpp_gc_garbage_estimate();
       
@@ -219,6 +217,8 @@ static inline void MaybeMinorCollect()
          sForceSuspendSafepoint = oldAgg;
       }
 
+      if (reserved < sLastReservedBytes)
+         sLastReservedBytes = reserved;
       sMinorLastCollect = now;
    }
 }
@@ -7000,7 +7000,7 @@ void InitAlloc() //inits
       int pr = ReadEnvBool("HX_GC_PARALLEL_REF_PROC", 1);
       int fs = ReadEnvBool("HX_GC_FORCE_SUSPEND", 0);
       int bd = ReadEnvInt("HX_GC_MINOR_BASE_DELTA_BYTES", 10 * 1024 * 1024);
-      int gm = ReadEnvInt("HX_GC_MINOR_GATE_MS", 250);
+      int gm = ReadEnvInt("HX_GC_MINOR_GATE_MS", 500);
       int sb = ReadEnvInt("HX_GC_MINOR_START_BYTES", 8*1024*1024);
       int lr = ReadEnvBool("HX_GC_LARGE_REFRESH", 0);
       hx::GCConfig cfg = hx::GetGCConfig();
