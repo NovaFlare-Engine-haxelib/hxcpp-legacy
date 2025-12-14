@@ -39,6 +39,7 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_exit_gc_free_zone();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_safe_point();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_spam_collects(int inEveryNCalls);
 
+HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_minor();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_update();
 
 HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_get_minor_base_delta_bytes();
@@ -55,9 +56,7 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES size_t __hxcpp_gc_garbage_estimate();
 HXCPP_EXTERN_CLASS_ATTRIBUTES size_t __hxcpp_gc_get_last_garbage_estimate();
 
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_enable_log(bool enable);
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_enable_minor(bool enable);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_set_callback(Dynamic inFunc);
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_set_log_callback(Dynamic inFunc);
 
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_set_threads(int parallelThreads, int refineThreads);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_set_max_pause_ms(int inMs);

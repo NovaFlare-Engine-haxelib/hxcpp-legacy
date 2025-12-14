@@ -17,8 +17,6 @@
 
 #include <string>
 #include <stdlib.h>
-#include <stdarg.h>
-#include <stdio.h>
 #ifndef HX_WINDOWS
 #include <unistd.h>
 #endif
@@ -66,12 +64,6 @@ enum { gAlwaysMove = false };
     #pragma comment(lib, "Psapi.lib")
   #endif
 #endif
-#if defined(HX_MACOS) || defined(HX_IOS) || defined(IPHONE) || defined(IPHONEOS)
-#include <mach/mach.h>
-#endif
-#ifdef HX_GC_PTHREADS
-#include <sched.h>
-#endif
 
 #include <vector>
 #include <stdio.h>
@@ -84,44 +76,6 @@ enum { gAlwaysMove = false };
 #ifndef __has_builtin
 #define __has_builtin(x) 0
 #endif
-
-static inline void gc_spin_yield()
-{
-#ifdef HX_WINDOWS
-   Sleep(0);
-#elif defined(HX_GC_PTHREADS)
-   sched_yield();
-#else
-   ;
-#endif
-}
-
- static inline int AtomicSubClampZero(volatile int *ptr, int dec)
- {
-   while(true)
-   {
-      int cur = *ptr;
-      if (cur<=0) return cur;
-      int next = cur - dec;
-      if (next<0) next = 0;
-      if (_hx_atomic_compare_exchange(ptr, cur, next) == cur)
-         return next;
-      gc_spin_yield();
-   }
- }
-
-static inline int AtomicAddClampMax(volatile int *ptr, int inc, int max)
-{
-   while(true)
-   {
-      int cur = *ptr;
-      int next = cur + inc;
-      if (next>max) next = max;
-      if (_hx_atomic_compare_exchange(ptr, cur, next) == cur)
-         return next;
-      gc_spin_yield();
-   }
-}
 namespace {
 void DebuggerTrap()
 {
@@ -190,39 +144,9 @@ static size_t sLastGarbageEstimate = 0;
 static size_t sLastReservedBytes = 0;
 
 static hx::Object *sGcCallback = 0;
-static hx::Object *sLogCallback = 0;
 
 static int sLargeAllocRefreshEnabled = 1;
-static bool sEnableGCLog = false;
-static bool sEnableMinorGC = true;
-
-void GCLog(const char *fmt, ...)
-{
-   va_list args;
-   va_start(args, fmt);
-   vprintf(fmt, args);
-   va_end(args);
-
-   if (sLogCallback)
-   {
-      static bool inside = false;
-      if (inside) return;
-      inside = true;
-      
-      va_start(args, fmt);
-      char buffer[2048];
-      vsnprintf(buffer, 2048, fmt, args);
-      va_end(args);
-      
-      try {
-         String s(buffer);
-         Dynamic d(sLogCallback);
-         d(s);
-      } catch(...) {}
-      
-      inside = false;
-   }
-}
+static bool sEnableGCLog = true;
 
 // Forward declaration needed for MaybeMinorCollect
 size_t __hxcpp_gc_garbage_estimate();
@@ -230,7 +154,6 @@ size_t __hxcpp_gc_get_reserved_bytes();
 
 static inline void MaybeMinorCollect()
 {
-   if (!sEnableMinorGC) return;
    if (!sgAllocInit)
       return;
    if (!sgInternalEnable)
@@ -253,12 +176,12 @@ static inline void MaybeMinorCollect()
           size_t growth = reserved - sLastReservedBytes;
           // Only skip if growth is significant (> 1MB)
           // This prevents small allocations from blocking GC, while allowing heavy loading to proceed smoothly.
-          if (growth > 1.5 * 1024 * 1024)
+          if (growth > 1 * 1024 * 1024)
           {
              if (sEnableGCLog)
-          {
-             GCLog("[MinorGC Check] Heap Expanded (+%.2f MB). Skipping GC.\n", growth/1024.0/1024.0);
-          }
+             {
+                printf("[MinorGC Check] Heap Expanded (+%.2f MB). Skipping GC.\n", growth/1024.0/1024.0);
+             }
              sLastReservedBytes = reserved;
              sMinorLastCollect = now;
              return;
@@ -792,6 +715,17 @@ static int sgTimeToNextTableUpdate = 1;
 HxMutex  *gThreadStateChangeLock=0;
 HxMutex  *gSpecialObjectLock=0;
 
+static inline HxMutex &EnsureThreadStateChangeLock()
+{
+   if (!gThreadStateChangeLock) gThreadStateChangeLock = new HxMutex();
+   return *gThreadStateChangeLock;
+}
+static inline HxMutex &EnsureSpecialObjectLock()
+{
+   if (!gSpecialObjectLock) gSpecialObjectLock = new HxMutex();
+   return *gSpecialObjectLock;
+}
+
 class LocalAllocator;
 enum LocalAllocState { lasNew, lasRunning, lasStopped, lasWaiting, lasTerminal };
 
@@ -1007,7 +941,7 @@ enum ThreadPoolJob
 
 int sgThreadCount = 0;
 static ThreadPoolJob sgThreadPoolJob = tpjNone;
-static bool sgThreadPoolAbort = false;
+static volatile bool sgThreadPoolAbort = false;
 
 // Pthreads enters the sleep state while holding a mutex, so it no cost to update
 //  the sleeping state and thereby avoid over-signalling the condition
@@ -2063,17 +1997,12 @@ struct GlobalChunks
       if (inChunk)
          release(inChunk);
 
-      {
-         int spinTries = 0;
-         while(_hx_atomic_compare_exchange(&processListPopLock, 0, 1) != 0)
+      while(_hx_atomic_compare_exchange(&processListPopLock, 0, 1) != 0)
       {
          // Spin
          #ifdef PROFILE_THREAD_USAGE
          _hx_atomic_add(&sSpinCount, 1);
          #endif
-         spinTries++;
-         if ((spinTries & 1023)==0) gc_spin_yield();
-      }
       }
 
       while(true)
@@ -2126,7 +2055,6 @@ struct GlobalChunks
             {
                if ( sgThreadPoolAbort || sAllThreads == (1<<inThreadId) )
                   break;
-               if ((spinCount & 1023)==0) gc_spin_yield();
                if (processList)
                {
                   result =  popJobLocked(0);
@@ -2152,17 +2080,12 @@ struct GlobalChunks
 
    inline MarkChunk *alloc()
    {
-      {
-         int spinTries = 0;
-         while(_hx_atomic_compare_exchange(&freeListPopLock, 0, 1) != 0)
+      while(_hx_atomic_compare_exchange(&freeListPopLock, 0, 1) != 0)
       {
          // Spin
          #ifdef PROFILE_THREAD_USAGE
          _hx_atomic_add(&sSpinCount, 1);
          #endif
-         spinTries++;
-         if ((spinTries & 1023)==0) gc_spin_yield();
-      }
       }
 
       while(true)
@@ -2910,7 +2833,7 @@ InternalFinalizer::InternalFinalizer(hx::Object *inObj, finalizer inFinalizer)
    mFinalizer = inFinalizer;
 
    // Ensure this survives generational collect
-   AutoLock lock(*gSpecialObjectLock);
+   AutoLock lock(EnsureThreadStateChangeLock());
    sgFinalizers->push(this);
 }
 
@@ -3207,7 +3130,7 @@ void  GCSetFinalizer( hx::Object *obj, hx::finalizer f )
    if (((unsigned int *)obj)[-1] & HX_GC_CONST_ALLOC_BIT)
       throw Dynamic(HX_CSTRING("set_finalizer - invalid const object"));
 
-   AutoLock lock(*gSpecialObjectLock);
+   AutoLock lock(EnsureThreadStateChangeLock());
    if (f==0)
    {
       FinalizerMap::iterator i = sFinalizerMap.find(obj);
@@ -3227,7 +3150,7 @@ void  GCSetHaxeFinalizer( hx::Object *obj, HaxeFinalizer f )
    if (((unsigned int *)obj)[-1] & HX_GC_CONST_ALLOC_BIT)
       throw Dynamic(HX_CSTRING("set_finalizer - invalid const object"));
 
-   AutoLock lock(*gSpecialObjectLock);
+   AutoLock lock(EnsureThreadStateChangeLock());
    if (f==0)
    {
       HaxeFinalizerMap::iterator i = sHaxeFinalizerMap.find(obj);
@@ -3245,13 +3168,13 @@ void GCDoNotKill(hx::Object *inObj)
    if (((unsigned int *)inObj)[-1] & HX_GC_CONST_ALLOC_BIT)
       throw Dynamic(HX_CSTRING("doNotKill - invalid const object"));
 
-   AutoLock lock(*gSpecialObjectLock);
+   AutoLock lock(EnsureThreadStateChangeLock());
    sMakeZombieSet.insert(inObj);
 }
 
 hx::Object *GCGetNextZombie()
 {
-   AutoLock lock(*gSpecialObjectLock);
+   AutoLock lock(EnsureThreadStateChangeLock());
    if (sZombieList.empty())
       return 0;
    hx::Object *result = sZombieList.pop();
@@ -3260,13 +3183,13 @@ hx::Object *GCGetNextZombie()
 
 void RegisterWeakHash(HashBase<String> *inHash)
 {
-   AutoLock lock(*gSpecialObjectLock);
+   AutoLock lock(EnsureThreadStateChangeLock());
    sWeakHashList.push(inHash);
 }
 
 void RegisterWeakHash(HashBase<Dynamic> *inHash)
 {
-   AutoLock lock(*gSpecialObjectLock);
+   AutoLock lock(EnsureThreadStateChangeLock());
    sWeakHashList.push(inHash);
 }
 
@@ -4023,7 +3946,7 @@ public:
 
          #ifndef HXCPP_SINGLE_THREADED_APP
          hx::EnterGCFreeZone();
-         gThreadStateChangeLock->Lock();
+         EnsureThreadStateChangeLock().Lock();
          hx::ExitGCFreeZoneLocked();
 
          result = GetNextFree(inRequiredBytes);
@@ -4072,7 +3995,7 @@ public:
          mCurrentRowsInUse += result->GetFreeRows();
 
          #ifndef HXCPP_SINGLE_THREADED_APP
-         gThreadStateChangeLock->Unlock();
+         EnsureThreadStateChangeLock().Unlock();
          #endif
 
 
@@ -4623,15 +4546,15 @@ public:
  
    void *GetIDObject(int inIndex)
    {
-      AutoLock lock(*gSpecialObjectLock);
-      if (inIndex<0 || inIndex>hx::sIdObjectMap.size())
+      AutoLock lock(EnsureSpecialObjectLock());
+      if (inIndex<0 || inIndex>=hx::sIdObjectMap.size())
          return 0;
       return hx::sIdObjectMap[inIndex];
    }
 
    int GetObjectID(void * inPtr)
    {
-      AutoLock lock(*gSpecialObjectLock);
+      AutoLock lock(EnsureSpecialObjectLock());
       hx::ObjectIdMap::iterator i = hx::sObjectIdMap.find( (hx::Object *)inPtr );
       if (i!=hx::sObjectIdMap.end())
          return i->second;
@@ -4811,10 +4734,9 @@ public:
          if (mZeroListQueue>=sMaxZeroQueueSize)
          {
             spinCount++;
-            if (spinCount<10000) {
-               gc_spin_yield();
+            if (spinCount<10000)
+               // Spin
                continue;
-            }
             // Full for now, so sleep...
             return true;
          }
@@ -4832,7 +4754,7 @@ public:
          if (info->tryZero())
          {
             // We zeroed it, so increase queue count
-            AtomicAddClampMax(&mZeroListQueue, 1, sMaxZeroQueueSize);
+            _hx_atomic_add(&mZeroListQueue, 1);
             #ifdef PROFILE_THREAD_USAGE
             sThreadBlockZeroCount++;
             #endif
@@ -4846,7 +4768,7 @@ public:
    void onZeroedBlockDequeued()
    {
       // Wake the thread?
-      if (AtomicSubClampZero(&mZeroListQueue, 1)<sMinZeroQueueSize && !sRunningThreads)
+      if (_hx_atomic_sub(&mZeroListQueue, 1)<sMinZeroQueueSize && !sRunningThreads)
       {
          if (mZeroListQueue + mThreadJobId < mZeroList.size())
          {
@@ -5279,7 +5201,7 @@ public:
             hx::PauseForCollect();
 
             hx::EnterGCFreeZone();
-            gThreadStateChangeLock->Lock();
+            EnsureThreadStateChangeLock().Lock();
             hx::ExitGCFreeZoneLocked();
          }
          else
@@ -7203,13 +7125,9 @@ void *InternalNew(int inSize,bool inIsObject)
 }
 
 
-static bool sEnableGCLog = false;
+static bool sEnableGCLog = true;
 void __hxcpp_gc_enable_log(bool enable) {
     sEnableGCLog = enable;
-}
-
-void __hxcpp_gc_enable_minor(bool enable) {
-    sEnableMinorGC = enable;
 }
 
 void __hxcpp_gc_set_callback(Dynamic inFunc)
@@ -7221,18 +7139,6 @@ void __hxcpp_gc_set_callback(Dynamic inFunc)
     if (inFunc.mPtr) {
         sGcCallback = inFunc.mPtr;
         hx::GCAddRoot(&sGcCallback);
-    }
-}
-
-void __hxcpp_gc_set_log_callback(Dynamic inFunc)
-{
-    if (sLogCallback) {
-        hx::GCRemoveRoot(&sLogCallback);
-        sLogCallback = 0;
-    }
-    if (inFunc.mPtr) {
-        sLogCallback = inFunc.mPtr;
-        hx::GCAddRoot(&sLogCallback);
     }
 }
 
@@ -7248,7 +7154,7 @@ int InternalCollect(bool inMajor,bool inCompact)
        double garbage = sGlobalAlloc ? (double)sGlobalAlloc->MemGarbageEstimate() / 1024.0 / 1024.0 : 0.0;
        int threads = hx::GetGCConfig().parallelGcThreads;
        int refine = hx::GetGCConfig().concRefinementThreads;
-       GCLog("[GC] InternalCollect triggered. Major: %d, Compact: %d, Threads: %d, Refine: %d, Used: %.2f MB, Reserved: %.2f MB, Est.Garbage: %.2f MB\n", 
+       printf("[GC] InternalCollect triggered. Major: %d, Compact: %d, Threads: %d, Refine: %d, Used: %.2f MB, Reserved: %.2f MB, Est.Garbage: %.2f MB\n", 
            inMajor, inCompact, threads, refine, used, reserved, garbage);
    }
 
@@ -7583,19 +7489,11 @@ static size_t __hxcpp_process_used_bytes()
    }
 
    return 0;
-   #elif defined(HX_MACOS) || defined(HX_IOS) || defined(IPHONE) || defined(IPHONEOS)
+   #elif defined(HX_MACOS) || defined(HX_IOS)
    mach_task_basic_info info;
    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
       return (size_t)info.resident_size;
-   {
-      task_vm_info_data_t vmInfo;
-      mach_msg_type_number_t count2 = TASK_VM_INFO_COUNT;
-      if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &count2) == KERN_SUCCESS)
-      {
-         return (size_t)vmInfo.phys_footprint;
-      }
-   }
    return 0;
    #elif defined(HX_LINUX) || defined(HX_ANDROID)
    // Try /proc/self/status for VmRSS
@@ -7758,13 +7656,13 @@ void __hxcpp_set_finalizer(Dynamic inObj, void *inFunc)
 
 void __hxcpp_add_member_finalizer(hx::Object *inObject, _hx_member_finalizer f, bool inPin)
 {
-   AutoLock lock(*gSpecialObjectLock);
+   AutoLock lock(EnsureThreadStateChangeLock());
    hx::sFinalizableList.push( hx::Finalizable(inObject, f, inPin) );
 }
 
 void __hxcpp_add_alloc_finalizer(void *inAlloc, _hx_alloc_finalizer f, bool inPin)
 {
-   AutoLock lock(*gSpecialObjectLock);
+   AutoLock lock(EnsureThreadStateChangeLock());
    hx::sFinalizableList.push( hx::Finalizable(inAlloc, f, inPin) );
 }
 
