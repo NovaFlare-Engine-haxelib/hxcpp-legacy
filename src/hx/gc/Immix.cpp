@@ -143,7 +143,7 @@ static size_t sLastReservedBytes = 0;
 static hx::Object *sGcCallback = 0;
 
 static int sLargeAllocRefreshEnabled = 1;
-static bool sEnableGCLog = true;
+static bool sEnableGCLog = false;
 static int sGarbageWeightContainer = 1;
 static int sGarbageWeightData = 1;
 static int sChurnSkipOverrideEnabled = 1;
@@ -7029,8 +7029,8 @@ void InitAlloc() //inits
       int cw = ReadEnvInt("HX_GC_CONTAINER_WEIGHT", 5);
       int dw = ReadEnvInt("HX_GC_DATA_WEIGHT", 1);
       int co = ReadEnvInt("HX_GC_CHURN_SKIP_OVERRIDE", 1);
-      int cr = ReadEnvInt("HX_GC_CHURN_CONTAINER_RATIO_PERMILLE", 600);
-      int st = ReadEnvInt("HX_GC_CHURN_SURVIVAL_THRESHOLD_PERMILLE", 350);
+      int cr = ReadEnvInt("HX_GC_CHURN_CONTAINER_RATIO_PERMILLE", 500);
+      int st = ReadEnvInt("HX_GC_CHURN_SURVIVAL_THRESHOLD_PERMILLE", 500);
       hx::GCConfig cfg = hx::GetGCConfig();
       cfg.parallelGcThreads = pg;
       cfg.concRefinementThreads = rt;
@@ -7155,7 +7155,7 @@ void *InternalNew(int inSize,bool inIsObject)
 }
 
 
-static bool sEnableGCLog = true;
+static bool sEnableGCLog = false;
 void __hxcpp_gc_enable_log(bool enable) {
     sEnableGCLog = enable;
 }
