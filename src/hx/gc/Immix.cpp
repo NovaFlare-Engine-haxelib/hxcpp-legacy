@@ -143,11 +143,19 @@ static size_t sLastReservedBytes = 0;
 static hx::Object *sGcCallback = 0;
 
 static int sLargeAllocRefreshEnabled = 1;
-static bool sEnableGCLog = false;
+static bool sEnableGCLog = true;
+static int sGarbageWeightContainer = 1;
+static int sGarbageWeightData = 1;
+static int sChurnSkipOverrideEnabled = 1;
+static int sChurnContainerRatioPermille = 600;
+static int sChurnSurvivalThresholdPermille = 350;
 
 // Forward declaration needed for MaybeMinorCollect
 size_t __hxcpp_gc_garbage_estimate();
 size_t __hxcpp_gc_get_reserved_bytes();
+double __hxcpp_gc_survival_rate();
+size_t __hxcpp_gc_container_alloc_since_gc();
+size_t __hxcpp_gc_data_alloc_since_gc();
 
 static inline void MaybeMinorCollect()
 {
@@ -173,32 +181,31 @@ static inline void MaybeMinorCollect()
           size_t growth = reserved - sLastReservedBytes;
           // Only skip if growth is significant (> 1MB)
           // This prevents small allocations from blocking GC, while allowing heavy loading to proceed smoothly.
-          if (growth > 1.2 * 1024 * 1024)
-          {
-             if (sEnableGCLog)
+          if (growth > (size_t)sMinorBaseDeltaBytes * 0.15)
+         {
+            double survival = __hxcpp_gc_survival_rate();
+            size_t cAlloc = __hxcpp_gc_container_alloc_since_gc();
+            size_t dAlloc = __hxcpp_gc_data_alloc_since_gc();
+            double denom = (double)cAlloc + (double)dAlloc;
+            double cRatio = denom>0 ? (double)cAlloc/denom : 0.0;
+            bool churnOverride = sChurnSkipOverrideEnabled &&
+                                 survival*1000.0 < (double)sChurnSurvivalThresholdPermille &&
+                                 cRatio*1000.0 >= (double)sChurnContainerRatioPermille;
+            if (!churnOverride)
              {
-                printf("[MinorGC Check] Heap Expanded (+%.2f MB). Skipping GC.\n", growth/1024.0/1024.0);
+                if (sEnableGCLog)
+                {
+                   printf("[MinorGC Check] Heap Expanded (+%.2f MB). Skipping GC.\n", growth/1024.0/1024.0);
+                }
+                sLastReservedBytes = reserved;
+                sMinorLastCollect = now;
+                return;
              }
-             sLastReservedBytes = reserved;
-             sMinorLastCollect = now;
-             return;
           }
           // Update baseline for small growth, but proceed to check garbage
-          sLastReservedBytes = reserved;
       }
 
       size_t garbageEstimate = __hxcpp_gc_garbage_estimate();
-      
-      // Log for debug
-      if (sEnableGCLog)
-      {
-         /*
-         printf("[MinorGC Check] Garbage: %.2f KB, Threshold: %.2f KB, Base: %.2f KB\n", 
-               (double)garbageEstimate/1024.0, 
-               (double)((size_t)sMinorBaseDeltaBytes + sLastGarbageEstimate)/1024.0,
-               (double)sLastGarbageEstimate/1024.0);
-         */
-      }
 
       if (garbageEstimate == 0)
          return;
@@ -215,6 +222,8 @@ static inline void MaybeMinorCollect()
          sForceSuspendSafepoint = 1;
          __hxcpp_collect(false);
          sForceSuspendSafepoint = oldAgg;
+
+         sLastReservedBytes = __hxcpp_gc_get_reserved_bytes();
       }
 
       if (reserved < sLastReservedBytes)
@@ -6186,12 +6195,16 @@ public:
    bool            mGlobalStackLock;
    int             mStackLocks;
    size_t          mBytesAllocatedSinceGC;
+   size_t          mContainerBytesAllocatedSinceGC;
+   size_t          mDataBytesAllocatedSinceGC;
 
 public:
    LocalAllocator(int *inTopOfStack=0)
    {
       Reset();
       mBytesAllocatedSinceGC = 0;
+      mContainerBytesAllocatedSinceGC = 0;
+      mDataBytesAllocatedSinceGC = 0;
 
       #ifdef HXCPP_GC_GENERATIONAL
       mOldReferrers = 0;
@@ -6572,6 +6585,8 @@ public:
    void SetupStackAndCollect(bool inMajor, bool inForceCompact, bool inLocked=false,bool inFreeIsFragged=false)
    {
       mBytesAllocatedSinceGC = 0;
+      mContainerBytesAllocatedSinceGC = 0;
+      mDataBytesAllocatedSinceGC = 0;
       #ifndef HXCPP_SINGLE_THREADED_APP
         #if HXCPP_DEBUG
         if (mGCFreeZone)
@@ -6674,6 +6689,10 @@ public:
                int size = allocSize - 4;
                ((unsigned int *)buffer)[-1] = size | inObjectFlags;
                mBytesAllocatedSinceGC += size;
+               if (inObjectFlags & IMMIX_ALLOC_IS_CONTAINER)
+                  mContainerBytesAllocatedSinceGC += size;
+               else
+                  mDataBytesAllocatedSinceGC += size;
 
                #if defined(HXCPP_GC_CHECK_POINTER) && defined(HXCPP_GC_DEBUG_ALWAYS_MOVE)
                hx::GCOnNewPointer(buffer);
@@ -6707,6 +6726,10 @@ public:
                spaceStart = end;
 
                mBytesAllocatedSinceGC += inSize;
+               if (inObjectFlags & IMMIX_ALLOC_IS_CONTAINER)
+                  mContainerBytesAllocatedSinceGC += inSize;
+               else
+                  mDataBytesAllocatedSinceGC += inSize;
 
                #if defined(HXCPP_GC_CHECK_POINTER) && defined(HXCPP_GC_DEBUG_ALWAYS_MOVE)
                hx::GCOnNewPointer(buffer);
@@ -6999,10 +7022,15 @@ void InitAlloc() //inits
       int mp = ReadEnvInt("HX_GC_MAX_PAUSE_MS", 1);
       int pr = ReadEnvBool("HX_GC_PARALLEL_REF_PROC", 1);
       int fs = ReadEnvBool("HX_GC_FORCE_SUSPEND", 0);
-      int bd = ReadEnvInt("HX_GC_MINOR_BASE_DELTA_BYTES", 10 * 1024 * 1024);
-      int gm = ReadEnvInt("HX_GC_MINOR_GATE_MS", 500);
+      int bd = ReadEnvInt("HX_GC_MINOR_BASE_DELTA_BYTES", 5 * 1024 * 1024);
+      int gm = ReadEnvInt("HX_GC_MINOR_GATE_MS", 333);
       int sb = ReadEnvInt("HX_GC_MINOR_START_BYTES", 8*1024*1024);
       int lr = ReadEnvBool("HX_GC_LARGE_REFRESH", 0);
+      int cw = ReadEnvInt("HX_GC_CONTAINER_WEIGHT", 5);
+      int dw = ReadEnvInt("HX_GC_DATA_WEIGHT", 1);
+      int co = ReadEnvInt("HX_GC_CHURN_SKIP_OVERRIDE", 1);
+      int cr = ReadEnvInt("HX_GC_CHURN_CONTAINER_RATIO_PERMILLE", 600);
+      int st = ReadEnvInt("HX_GC_CHURN_SURVIVAL_THRESHOLD_PERMILLE", 350);
       hx::GCConfig cfg = hx::GetGCConfig();
       cfg.parallelGcThreads = pg;
       cfg.concRefinementThreads = rt;
@@ -7015,6 +7043,11 @@ void InitAlloc() //inits
       sMinorMinIntervalMs = gm>0 ? gm : 0;
       sMinorInitTime = __hxcpp_time_stamp();
       sMinorStartBytes = sb>0 ? (size_t)sb : 0;
+      sGarbageWeightContainer = cw>0 ? cw : 1;
+      sGarbageWeightData = dw>0 ? dw : 1;
+      sChurnSkipOverrideEnabled = co>0 ? 1 : 0;
+      sChurnContainerRatioPermille = cr>0 ? cr : 600;
+      sChurnSurvivalThresholdPermille = st>0 ? st : 350;
    }
    
    sGlobalAlloc = new GlobalAllocator();
@@ -7122,7 +7155,7 @@ void *InternalNew(int inSize,bool inIsObject)
 }
 
 
-static bool sEnableGCLog = false;
+static bool sEnableGCLog = true;
 void __hxcpp_gc_enable_log(bool enable) {
     sEnableGCLog = enable;
 }
@@ -7574,15 +7607,20 @@ size_t __hxcpp_gc_working_memory()
 
 size_t GlobalAllocator::MemGarbageEstimate()
    {
-      size_t newAllocations = mAllocatedSinceLastGC;
-      
-      // Add up allocations from all threads
+      size_t newContainerAlloc = 0;
+      size_t newDataAlloc = 0;
       for(int i=0; i<mLocalAllocs.size(); i++)
          if (mLocalAllocs[i])
-            newAllocations += mLocalAllocs[i]->mBytesAllocatedSinceGC;
-
-      // Estimated garbage = New Allocations * (1.0 - Survival Rate)
-      return (size_t)(newAllocations * (1.0 - mSurvivalRate));
+         {
+            newContainerAlloc += mLocalAllocs[i]->mContainerBytesAllocatedSinceGC;
+            newDataAlloc += mLocalAllocs[i]->mDataBytesAllocatedSinceGC;
+         }
+      size_t fallback = mAllocatedSinceLastGC;
+      if (fallback>0 && newContainerAlloc==0 && newDataAlloc==0)
+         newDataAlloc += fallback;
+      double weighted = (double)newContainerAlloc * (double)sGarbageWeightContainer +
+                        (double)newDataAlloc * (double)sGarbageWeightData;
+      return (size_t)(weighted * (1.0 - mSurvivalRate));
    }
 
 void GlobalAllocator::UpdateSurvivalRate(size_t oldRowsInUse)
@@ -7594,6 +7632,8 @@ void GlobalAllocator::UpdateSurvivalRate(size_t oldRowsInUse)
          {
              totalAllocated += mLocalAllocs[i]->mBytesAllocatedSinceGC;
              mLocalAllocs[i]->mBytesAllocatedSinceGC = 0;
+             mLocalAllocs[i]->mContainerBytesAllocatedSinceGC = 0;
+             mLocalAllocs[i]->mDataBytesAllocatedSinceGC = 0;
          }
       }
       // If using Block-based fallback
@@ -7618,6 +7658,41 @@ void GlobalAllocator::UpdateSurvivalRate(size_t oldRowsInUse)
 size_t __hxcpp_gc_get_reserved_bytes()
 {
    return sGlobalAlloc ? sGlobalAlloc->MemReserved() : 0;
+}
+
+double __hxcpp_gc_survival_rate()
+{
+   return sGlobalAlloc ? sGlobalAlloc->mSurvivalRate : 1.0;
+}
+
+size_t __hxcpp_gc_container_alloc_since_gc()
+{
+   size_t sum = 0;
+   if (sGlobalAlloc)
+   {
+      for(int i=0;i<sGlobalAlloc->mLocalAllocs.size();i++)
+      {
+         LocalAllocator *la = sGlobalAlloc->mLocalAllocs[i];
+         if (la)
+            sum += la->mContainerBytesAllocatedSinceGC;
+      }
+   }
+   return sum;
+}
+
+size_t __hxcpp_gc_data_alloc_since_gc()
+{
+   size_t sum = 0;
+   if (sGlobalAlloc)
+   {
+      for(int i=0;i<sGlobalAlloc->mLocalAllocs.size();i++)
+      {
+         LocalAllocator *la = sGlobalAlloc->mLocalAllocs[i];
+         if (la)
+            sum += la->mDataBytesAllocatedSinceGC;
+      }
+   }
+   return sum;
 }
 
    int   __hxcpp_gc_used_bytes()
@@ -7677,6 +7752,12 @@ void hxcpp_set_top_of_stack()
 void __hxcpp_gc_update()
 {
    MaybeMinorCollect();
+}
+
+void __hxcpp_gc_set_garbage_weights(int containerWeight, int dataWeight)
+{
+   sGarbageWeightContainer = containerWeight>0 ? containerWeight : 1;
+   sGarbageWeightData = dataWeight>0 ? dataWeight : 1;
 }
 
 void __hxcpp_enter_gc_free_zone()

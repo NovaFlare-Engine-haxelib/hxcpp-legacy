@@ -54,6 +54,7 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES size_t __hxcpp_gc_get_working_memory_size();
 HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_gc_get_target_free_space_percentage();
 HXCPP_EXTERN_CLASS_ATTRIBUTES size_t __hxcpp_gc_garbage_estimate();
 HXCPP_EXTERN_CLASS_ATTRIBUTES size_t __hxcpp_gc_get_last_garbage_estimate();
+HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_set_garbage_weights(int containerWeight, int dataWeight);
 
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_enable_log(bool enable);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_set_callback(Dynamic inFunc);
