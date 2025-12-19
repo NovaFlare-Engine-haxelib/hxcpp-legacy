@@ -176,59 +176,73 @@ static inline void MaybeMinorCollect()
    if (now - sMinorLastCollect >= (double)sMinorMinIntervalMs/1000.0)
    {
       size_t reserved = __hxcpp_gc_get_reserved_bytes();
+      bool churnOverride = false;
+      size_t growth = 0;
       if (reserved > sLastReservedBytes)
       {
-          size_t growth = reserved - sLastReservedBytes;
-          // Only skip if growth is significant (> 1MB)
-          // This prevents small allocations from blocking GC, while allowing heavy loading to proceed smoothly.
-          if (growth > (size_t)sMinorBaseDeltaBytes * 0.15)
+         growth = reserved - sLastReservedBytes;
+         // Only skip if growth is significant (> 1MB)
+         // This prevents small allocations from blocking GC, while allowing heavy loading to proceed smoothly.
+         if (growth > (size_t)sMinorBaseDeltaBytes * 0.05)
          {
             double survival = __hxcpp_gc_survival_rate();
             size_t cAlloc = __hxcpp_gc_container_alloc_since_gc();
             size_t dAlloc = __hxcpp_gc_data_alloc_since_gc();
             double denom = (double)cAlloc + (double)dAlloc;
             double cRatio = denom>0 ? (double)cAlloc/denom : 0.0;
-            bool churnOverride = sChurnSkipOverrideEnabled &&
-                                 survival*1000.0 < (double)sChurnSurvivalThresholdPermille &&
-                                 cRatio*1000.0 >= (double)sChurnContainerRatioPermille;
-            if (!churnOverride)
-             {
-                if (sEnableGCLog)
-                {
-                   printf("[MinorGC Check] Heap Expanded (+%.2f MB). Skipping GC.\n", growth/1024.0/1024.0);
-                }
-                sLastReservedBytes = reserved;
-                sMinorLastCollect = now;
-                return;
-             }
-          }
-          // Update baseline for small growth, but proceed to check garbage
+            
+            if (sChurnSkipOverrideEnabled) {
+               if (survival*1000.0 >= (double)sChurnSurvivalThresholdPermille &&
+                  cRatio*1000.0 >= (double)sChurnContainerRatioPermille)
+               {
+                  churnOverride = true;
+               }
+            };
+            if (sEnableGCLog)
+            {
+               printf("[MinorGC Check] Survival rate %.2f%%, Container Ratio %.2f%%. churnOverride %d.\n", survival*1000.0, cRatio*1000.0, churnOverride);
+            }
+         }
+         // Update baseline for small growth, but proceed to check garbage
       }
 
-      size_t garbageEstimate = __hxcpp_gc_garbage_estimate();
+      //printf("%.2f.\n", growth/1024.0/1024.0);
 
-      if (garbageEstimate == 0)
-         return;
-         
-      if (sLastGarbageEstimate > garbageEstimate)
-         sLastGarbageEstimate = garbageEstimate;
-
-      if (sMinorBaseDeltaBytes > 0 && 
-         garbageEstimate > (size_t)sMinorBaseDeltaBytes + sLastGarbageEstimate
-      )
+      if (churnOverride)
       {
-         sStrictMinorRequested = 0;
-         int oldAgg = sForceSuspendSafepoint;
-         sForceSuspendSafepoint = 1;
-         __hxcpp_collect(false);
-         sForceSuspendSafepoint = oldAgg;
-
-         sLastReservedBytes = __hxcpp_gc_get_reserved_bytes();
-      }
-
-      if (reserved < sLastReservedBytes)
+         if (sEnableGCLog)
+         {
+            printf("[MinorGC Check] Heap Expanded (+%.2f MB). Skipping GC.\n", growth/1024.0/1024.0);
+         }
          sLastReservedBytes = reserved;
-      sMinorLastCollect = now;
+         sMinorLastCollect = now;
+         return;
+      } else {
+         size_t garbageEstimate = __hxcpp_gc_garbage_estimate();
+
+         if (garbageEstimate == 0)
+            return;
+            
+         if (sLastGarbageEstimate > garbageEstimate)
+            sLastGarbageEstimate = garbageEstimate;
+
+         if (sMinorBaseDeltaBytes > 0 && 
+            garbageEstimate > (size_t)sMinorBaseDeltaBytes + sLastGarbageEstimate
+         )
+         {
+            sStrictMinorRequested = 0;
+            int oldAgg = sForceSuspendSafepoint;
+            sForceSuspendSafepoint = 1;
+            __hxcpp_collect(false);
+            sForceSuspendSafepoint = oldAgg;
+
+            sLastReservedBytes = __hxcpp_gc_get_reserved_bytes();
+         }
+
+         if (reserved < sLastReservedBytes)
+            sLastReservedBytes = reserved;
+         sMinorLastCollect = now;
+      }
    }
 }
 
@@ -3571,8 +3585,6 @@ public:
 
    void *AllocLarge(int inSize, bool inClear)
    {
-      MaybeMinorCollect();
-
       if (hx::gPauseForCollect)
          __hxcpp_gc_safe_point();
 
@@ -7029,8 +7041,8 @@ void InitAlloc() //inits
       int cw = ReadEnvInt("HX_GC_CONTAINER_WEIGHT", 5);
       int dw = ReadEnvInt("HX_GC_DATA_WEIGHT", 1);
       int co = ReadEnvInt("HX_GC_CHURN_SKIP_OVERRIDE", 1);
-      int cr = ReadEnvInt("HX_GC_CHURN_CONTAINER_RATIO_PERMILLE", 500);
-      int st = ReadEnvInt("HX_GC_CHURN_SURVIVAL_THRESHOLD_PERMILLE", 500);
+      int cr = ReadEnvInt("HX_GC_CHURN_CONTAINER_RATIO_PERMILLE", 600);
+      int st = ReadEnvInt("HX_GC_CHURN_SURVIVAL_THRESHOLD_PERMILLE", 350);
       hx::GCConfig cfg = hx::GetGCConfig();
       cfg.parallelGcThreads = pg;
       cfg.concRefinementThreads = rt;
