@@ -801,6 +801,7 @@ void __string_hash_set_int64(HX_MAP_THIS_ARG, String inKey, cpp::Int64 inValue)
 
 Dynamic  __string_hash_get(Dynamic inHash,String inKey)
 {
+   if (inHash.mPtr == 0) return null();
    StringHashBase *hash = static_cast<StringHashBase *>(inHash.GetPtr());
    if (!hash)
       return null();
@@ -812,9 +813,10 @@ Dynamic  __string_hash_get(Dynamic inHash,String inKey)
 
 int  __string_hash_get_int(Dynamic inHash,String inKey)
 {
+   if (inHash.mPtr == 0) return 0;
    StringHashBase *hash = static_cast<StringHashBase *>(inHash.GetPtr());
    if (!hash)
-      return null();
+      return 0;
 
    int result = 0;
    hash->query(inKey,result);
@@ -824,9 +826,10 @@ int  __string_hash_get_int(Dynamic inHash,String inKey)
 
 Float  __string_hash_get_float(Dynamic inHash,String inKey)
 {
+   if (inHash.mPtr == 0) return 0.0;
    StringHashBase *hash = static_cast<StringHashBase *>(inHash.GetPtr());
    if (!hash)
-      return null();
+      return 0.0;
 
    Float result = 0;
    hash->query(inKey,result);
@@ -835,6 +838,7 @@ Float  __string_hash_get_float(Dynamic inHash,String inKey)
 
 String  __string_hash_get_string(Dynamic inHash,String inKey)
 {
+   if (inHash.mPtr == 0) return null();
    StringHashBase *hash = static_cast<StringHashBase *>(inHash.GetPtr());
    if (!hash)
       return null();
@@ -846,9 +850,10 @@ String  __string_hash_get_string(Dynamic inHash,String inKey)
 
 cpp::Int64 __string_hash_get_int64(Dynamic inHash,String inKey)
 {
+   if (inHash.mPtr == 0) return 0;
    StringHashBase *hash = static_cast<StringHashBase *>(inHash.GetPtr());
    if (!hash)
-      return null();
+      return 0;
 
    cpp::Int64 result = 0;
    hash->query(inKey,result);
@@ -857,6 +862,7 @@ cpp::Int64 __string_hash_get_int64(Dynamic inHash,String inKey)
 
 bool  __string_hash_exists(Dynamic &ioHash,String inKey)
 {
+   if (ioHash.mPtr == 0) return false;
    StringHashBase *hash = static_cast<StringHashBase *>(ioHash.GetPtr());
    if (!hash)
       return false;
@@ -865,6 +871,7 @@ bool  __string_hash_exists(Dynamic &ioHash,String inKey)
 
 bool  __string_hash_remove(Dynamic &ioHash,String inKey)
 {
+   if (ioHash.mPtr == 0) return false;
    StringHashBase *hash = static_cast<StringHashBase *>(ioHash.GetPtr());
    if (!hash)
       return false;
@@ -873,6 +880,7 @@ bool  __string_hash_remove(Dynamic &ioHash,String inKey)
 
 Array<String> __string_hash_keys(Dynamic &ioHash)
 {
+   if (ioHash.mPtr == 0) return Array_obj<String>::__new();
    StringHashBase *hash = static_cast<StringHashBase *>(ioHash.GetPtr());
    if (!hash)
       return Array_obj<String>::__new();
@@ -881,6 +889,7 @@ Array<String> __string_hash_keys(Dynamic &ioHash)
 
 Dynamic __string_hash_values(Dynamic &ioHash)
 {
+   if (ioHash.mPtr == 0) return Array_obj<Dynamic>::__new();
    StringHashBase *hash = static_cast<StringHashBase *>(ioHash.GetPtr());
    if (!hash)
       return Array_obj<Dynamic>::__new();

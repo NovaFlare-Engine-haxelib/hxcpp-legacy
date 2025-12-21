@@ -123,7 +123,7 @@ static size_t sgMaximumFreeSpace  = 1024*1024*1024;
 class GlobalAllocator;
 extern GlobalAllocator *sGlobalAlloc;
 int __hxcpp_gc_large_bytes();
-static int sForceSuspendSafepoint = 0;
+static volatile int sForceSuspendSafepoint = 0;
 static size_t __hxcpp_process_used_bytes();
 size_t __hxcpp_gc_working_memory();
 int __hxcpp_gc_reserved_bytes();
@@ -144,18 +144,17 @@ static hx::Object *sGcCallback = 0;
 
 static int sLargeAllocRefreshEnabled = 1;
 static bool sEnableGCLog = false;
-static int sGarbageWeightContainer = 1;
-static int sGarbageWeightData = 1;
-static int sChurnSkipOverrideEnabled = 1;
-static int sChurnContainerRatioPermille = 600;
-static int sChurnSurvivalThresholdPermille = 350;
 
 // Forward declaration needed for MaybeMinorCollect
 size_t __hxcpp_gc_garbage_estimate();
 size_t __hxcpp_gc_get_reserved_bytes();
-double __hxcpp_gc_survival_rate();
-size_t __hxcpp_gc_container_alloc_since_gc();
-size_t __hxcpp_gc_data_alloc_since_gc();
+
+static HxMutex *sMinorCollectLock = 0;
+static inline HxMutex &EnsureMinorCollectLock()
+{
+   if (!sMinorCollectLock) sMinorCollectLock = new HxMutex();
+   return *sMinorCollectLock;
+}
 
 static inline void MaybeMinorCollect()
 {
@@ -175,73 +174,83 @@ static inline void MaybeMinorCollect()
 
    if (now - sMinorLastCollect >= (double)sMinorMinIntervalMs/1000.0)
    {
-      size_t reserved = __hxcpp_gc_get_reserved_bytes();
-      bool churnOverride = false;
-      size_t growth = 0;
-      if (reserved > sLastReservedBytes)
+      bool doCollect = false;
       {
-         growth = reserved - sLastReservedBytes;
-         // Only skip if growth is significant (> 1MB)
-         // This prevents small allocations from blocking GC, while allowing heavy loading to proceed smoothly.
-         if (growth > (size_t)sMinorBaseDeltaBytes * 0.05)
+         hx::EnterGCFreeZone();
+         EnsureMinorCollectLock().Lock();
+         hx::ExitGCFreeZone();
+
+         now = __hxcpp_time_stamp();
+         if (!sgIsCollecting && !hx::gPauseForCollect &&
+             now - sMinorLastCollect >= (double)sMinorMinIntervalMs/1000.0)
          {
-            double survival = __hxcpp_gc_survival_rate();
-            size_t cAlloc = __hxcpp_gc_container_alloc_since_gc();
-            size_t dAlloc = __hxcpp_gc_data_alloc_since_gc();
-            double denom = (double)cAlloc + (double)dAlloc;
-            double cRatio = denom>0 ? (double)cAlloc/denom : 0.0;
-            
-            if (sChurnSkipOverrideEnabled) {
-               if (survival*1000.0 >= (double)sChurnSurvivalThresholdPermille &&
-                  cRatio*1000.0 >= (double)sChurnContainerRatioPermille)
-               {
-                  churnOverride = true;
-               }
-            };
-            if (sEnableGCLog)
+            size_t reserved = __hxcpp_gc_get_reserved_bytes();
+            bool skip = false;
+            if (reserved > sLastReservedBytes)
             {
-               printf("[MinorGC Check] Survival rate %.2f%%, Container Ratio %.2f%%. churnOverride %d.\n", survival*1000.0, cRatio*1000.0, churnOverride);
+                size_t growth = reserved - sLastReservedBytes;
+                // Only skip if growth is significant (> 1MB)
+                // This prevents small allocations from blocking GC, while allowing heavy loading to proceed smoothly.
+                if (growth > 1.2 * 1024 * 1024)
+                {
+                   if (sEnableGCLog)
+                   {
+                      printf("[MinorGC Check] Heap Expanded (+%.2f MB). Skipping GC.\n", growth/1024.0/1024.0);
+                   }
+                   sLastReservedBytes = reserved;
+                   sMinorLastCollect = now;
+                   skip = true;
+                }
+                else
+                {
+                   // Update baseline for small growth, but proceed to check garbage
+                   sLastReservedBytes = reserved;
+                }
+            }
+
+            if (!skip)
+            {
+               size_t garbageEstimate = __hxcpp_gc_garbage_estimate();
+               
+               // Log for debug
+               if (sEnableGCLog)
+               {
+                  /*
+                  printf("[MinorGC Check] Garbage: %.2f KB, Threshold: %.2f KB, Base: %.2f KB\n", 
+                        (double)garbageEstimate/1024.0, 
+                        (double)((size_t)sMinorBaseDeltaBytes + sLastGarbageEstimate)/1024.0,
+                        (double)sLastGarbageEstimate/1024.0);
+                  */
+               }
+
+               if (garbageEstimate > 0)
+               {
+                  if (sLastGarbageEstimate > garbageEstimate)
+                     sLastGarbageEstimate = garbageEstimate;
+
+                  if (sMinorBaseDeltaBytes > 0 && 
+                     garbageEstimate > (size_t)sMinorBaseDeltaBytes + sLastGarbageEstimate
+                  )
+                  {
+                     doCollect = true;
+                  }
+               }
+               
+               if (reserved < sLastReservedBytes)
+                  sLastReservedBytes = reserved;
+               sMinorLastCollect = now;
             }
          }
-         // Update baseline for small growth, but proceed to check garbage
+         EnsureMinorCollectLock().Unlock();
       }
 
-      //printf("%.2f.\n", growth/1024.0/1024.0);
-
-      if (churnOverride)
+      if (doCollect)
       {
-         if (sEnableGCLog)
-         {
-            printf("[MinorGC Check] Heap Expanded (+%.2f MB). Skipping GC.\n", growth/1024.0/1024.0);
-         }
-         sLastReservedBytes = reserved;
-         sMinorLastCollect = now;
-         return;
-      } else {
-         size_t garbageEstimate = __hxcpp_gc_garbage_estimate();
-
-         if (garbageEstimate == 0)
-            return;
-            
-         if (sLastGarbageEstimate > garbageEstimate)
-            sLastGarbageEstimate = garbageEstimate;
-
-         if (sMinorBaseDeltaBytes > 0 && 
-            garbageEstimate > (size_t)sMinorBaseDeltaBytes + sLastGarbageEstimate
-         )
-         {
-            sStrictMinorRequested = 0;
-            int oldAgg = sForceSuspendSafepoint;
-            sForceSuspendSafepoint = 1;
-            __hxcpp_collect(false);
-            sForceSuspendSafepoint = oldAgg;
-
-            sLastReservedBytes = __hxcpp_gc_get_reserved_bytes();
-         }
-
-         if (reserved < sLastReservedBytes)
-            sLastReservedBytes = reserved;
-         sMinorLastCollect = now;
+         sStrictMinorRequested = 1;
+         int oldAgg = sForceSuspendSafepoint;
+         sForceSuspendSafepoint = 1;
+         __hxcpp_collect(false);
+         sForceSuspendSafepoint = oldAgg;
       }
    }
 }
@@ -2239,14 +2248,24 @@ public:
 
     void pushObj(hx::Object *inObject)
     {
-       if (marking->count < MarkChunk::SIZE)
+       if (!marking)
+          marking = sGlobalChunks.alloc();
+
+       if (marking)
        {
-          marking->push(inObject);
-       }
-       else
-       {
-          marking = sGlobalChunks.pushJob(marking,true);
-          marking->push(inObject);
+          if (marking->count < MarkChunk::SIZE)
+          {
+             marking->push(inObject);
+          }
+          else
+          {
+             MarkChunk *next = sGlobalChunks.pushJob(marking,true);
+             if (next)
+             {
+                marking = next;
+                marking->push(inObject);
+             }
+          }
        }
     }
 
@@ -2269,60 +2288,7 @@ public:
        marking = 0;
     }
 
-    void processMarkStack()
-    {
-       while(true)
-       {
-          if (!marking || !marking->count)
-          {
-             #ifdef HX_MULTI_THREAD_MARKING
-             if (sgThreadPoolAbort)
-             {
-                releaseJobs();
-                return;
-             }
-             #endif
-
-             marking = sGlobalChunks.popJobOrFinish(marking,mThreadId);
-             if (!marking)
-                break;
-
-             if (marking->count==MarkChunk::OBJ_ARRAY_JOB)
-             {
-                int n = marking->arrayElements;
-                hx::Object **elems = marking->arrayBase;
-                marking->count = 0;
-                MarkObjectArray(elems, n, this);
-                continue;
-             }
-          }
-
-          while(marking)
-          {
-             hx::Object *obj = marking->pop();
-             if (obj)
-             {
-                obj->__Mark(this);
-                #if HX_MULTI_THREAD_MARKING
-                // Load balance
-                if (sLazyThreads && marking->count>32)
-                {
-                   MarkChunk *c = sGlobalChunks.alloc();
-                   marking->count -= 16;
-                   c->count = 16;
-                   memcpy( c->stack, marking->stack + marking->count, 16*sizeof(hx::Object *));
-                   sGlobalChunks.pushJob(c,false);
-                }
-                #ifdef PROFILE_THREAD_USAGE
-                sThreadMarkCount[mThreadId]++;
-                #endif
-                #endif
-             }
-             else
-                break;
-          }
-       }
-    }
+    void processMarkStack();
 };
 
 
@@ -3585,6 +3551,8 @@ public:
 
    void *AllocLarge(int inSize, bool inClear)
    {
+      MaybeMinorCollect();
+
       if (hx::gPauseForCollect)
          __hxcpp_gc_safe_point();
 
@@ -3939,93 +3907,7 @@ public:
    }
 
 
-   BlockDataInfo *GetFreeBlock(int inRequiredBytes, hx::ImmixAllocator *inAlloc)
-   {
-      while(true)
-      {
-         BlockDataInfo *result = GetNextFree(inRequiredBytes);
-         if (result)
-         {
-            result->zeroAndUnlock();
-
-            // After zero/reclaim, it might be that the hole size is smaller than we thought.
-            if (result->mMaxHoleSize>=inRequiredBytes)
-               return result;
-
-            repoolReclaimedBlock(result);
-            continue;
-         }
-
-         if (hx::gPauseForCollect)
-         {
-            hx::PauseForCollect();
-            continue;
-         }
-
-         #ifndef HXCPP_SINGLE_THREADED_APP
-         hx::EnterGCFreeZone();
-         EnsureThreadStateChangeLock().Lock();
-         hx::ExitGCFreeZoneLocked();
-
-         result = GetNextFree(inRequiredBytes);
-         #endif
-
-         bool forceCompact = false;
-         if (!result && allowMoreBlocks() && (!sgInternalEnable || GetWorkingMemory()<sWorkingMemorySize))
-         {
-            if (AllocMoreBlocks(forceCompact,false))
-               result = GetNextFree(inRequiredBytes);
-         }
-
-         if (!result)
-         {
-            inAlloc->SetupStackAndCollect(false,forceCompact,true,true);
-            result = GetNextFree(inRequiredBytes);
-         }
-
-         if (!result && !forceCompact)
-         {
-            // Try with compact this time...
-            forceCompact = true;
-            inAlloc->SetupStackAndCollect(false,forceCompact,true,true);
-            result = GetNextFree(inRequiredBytes);
-         }
-
-         if (!result)
-         {
-            if (AllocMoreBlocks(forceCompact,false))
-               result = GetNextFree(inRequiredBytes);
-         }
-
-         if (!result)
-         {
-            GCLOG("Memory exhausted.\n");
-            #ifndef HXCPP_M64
-            GCLOG(" try 64 bit build.\n");
-            #endif
-            #ifndef HXCPP_GC_BIG_BLOCKS
-            GCLOG(" try HXCPP_GC_BIG_BLOCKS.\n");
-            #endif
-            DebuggerTrap();
-         }
-
-         // Assume all wil be used
-         mCurrentRowsInUse += result->GetFreeRows();
-
-         #ifndef HXCPP_SINGLE_THREADED_APP
-         EnsureThreadStateChangeLock().Unlock();
-         #endif
-
-
-         result->zeroAndUnlock();
-
-         // After zero/reclaim, it might be that the hole size is smaller than we thought.
-         if (result->mMaxHoleSize>=inRequiredBytes)
-            return result;
-
-         repoolReclaimedBlock(result);
-      }
-  }
+   BlockDataInfo *GetFreeBlock(int inRequiredBytes, hx::ImmixAllocator *inAlloc);
 
    #if  defined(HXCPP_VISIT_ALLOCS) // {
 
@@ -5041,7 +4923,7 @@ public:
    double tMarkLocal;
    double tMarkLocalEnd;
    double tMarked;
-   void MarkAll(bool inGenerational)
+   void MarkAll(bool inGenerational, hx::QuickVec<hx::Object *> *inRememberedSet = 0)
    {
       if (!inGenerational)
       {
@@ -5094,29 +4976,9 @@ public:
 
       mMarker.init();
 
-      hx::MarkClassStatics(&mMarker);
+      SafeMarkClassStatics(&mMarker);
 
-      {
-      hx::AutoMarkPush info(&mMarker,"Roots","root");
-
-      for(hx::RootSet::iterator i = hx::sgRootSet.begin(); i!=hx::sgRootSet.end(); ++i)
-      {
-         hx::Object *&obj = **i;
-         if (obj)
-            hx::MarkObjectAlloc(obj , &mMarker );
-      }
-
-      if (hx::sgOffsetRootSet)
-         for(hx::OffsetRootSet::iterator i = hx::sgOffsetRootSet->begin(); i!=hx::sgOffsetRootSet->end(); ++i)
-         {
-            char *ptr = *(char **)(i->first);
-            int offset = i->second;
-            hx::Object *obj = (hx::Object *)(ptr - offset);
-
-            if (obj)
-               hx::MarkObjectAlloc(obj , &mMarker );
-         }
-      } // automark
+      MarkRoots(&mMarker);
 
       #ifdef PROFILE_COLLECT
       hx::rootObjects = sObjectMarks;
@@ -5124,21 +4986,42 @@ public:
       #endif
 
 
-      {
-      hx::AutoMarkPush info(&mMarker,"Zombies","zombie");
-      // Mark zombies too....
-      for(int i=0;i<hx::sZombieList.size();i++)
-         hx::MarkObjectAlloc(hx::sZombieList[i] , &mMarker );
-      } // automark
+      MarkZombies(&mMarker);
 
       MEM_STAMP(tMarkLocal);
       hx::localCount = 0;
 
       mMarker.isGenerational = inGenerational;
 
+      // Scan large objects for internal pointers
+      for(int i=0;i<mLargeList.size();i++)
+      {
+         unsigned int *blob = mLargeList[i];
+         // Safe access to blob
+         CheckLargeObjectSafe(blob);
+      }
+
       // Mark local stacks
       for(int i=0;i<mLocalAllocs.size();i++)
-         MarkLocalAlloc(mLocalAllocs[i] , &mMarker);
+      {
+         #ifdef HXCPP_GC_GENERATIONAL
+         if (inGenerational)
+         {
+            hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
+            // Validate context pointer
+            if (!ctx) continue;
+            
+            // Use helper to avoid C2712
+            CheckGenerationalReferrersSafe(ctx, &mMarker, i);
+         }
+         #endif
+         SafeMarkLocalAlloc(mLocalAllocs[i] , &mMarker);
+      }
+
+      #ifdef HXCPP_GC_GENERATIONAL
+      if (inGenerational)
+          MarkRememberedSet(inRememberedSet, &mMarker);
+      #endif
 
       #ifdef PROFILE_COLLECT
       hx::localObjects = sObjectMarks;
@@ -5160,9 +5043,11 @@ public:
 
       MEM_STAMP(tMarked);
 
-      hx::FindZombies(mMarker);
+      // Clean up zombie list with safety checks
+      FindZombiesSafe(&mMarker);
 
-      hx::RunFinalizers();
+      // Run finalizers with safety checks
+      RunFinalizersSafe();
 
       #ifdef HXCPP_GC_VERIFY
       for(int i=0;i<mAllBlocks.size();i++)
@@ -5203,574 +5088,7 @@ public:
    }
    #endif
 
-   void Collect(bool inMajor, bool inForceCompact, bool inLocked,bool inFreeIsFragged)
-   {
-      PROFILE_COLLECT_SUMMARY_START;
-
-      #ifndef HXCPP_SINGLE_THREADED_APP
-      // If we set the flag from 0 -> 0xffffffff then we are the collector
-      //  otherwise, someone else is collecting at the moment - so wait...
-      if (_hx_atomic_compare_exchange((volatile int *)&hx::gPauseForCollect, 0, 0xffffffff) != 0)
-      {
-         if (inLocked)
-         {
-            gThreadStateChangeLock->Unlock();
-
-            hx::PauseForCollect();
-
-            hx::EnterGCFreeZone();
-            EnsureThreadStateChangeLock().Lock();
-            hx::ExitGCFreeZoneLocked();
-         }
-         else
-         {
-            hx::PauseForCollect();
-         }
-         return;
-      }
-      #endif
-
-      STAMP(t0)
-
-      // We are the collector - all must wait for us
-      LocalAllocator *this_local = 0;
-      #ifndef HXCPP_SINGLE_THREADED_APP
-      this_local = (LocalAllocator *)(hx::ImmixAllocator *)hx::tlsStackContext;
-
-      if (!inLocked)
-         gThreadStateChangeLock->Lock();
-
-      for(int i=0;i<mLocalAllocs.size();i++)
-         if (mLocalAllocs[i]!=this_local)
-            WaitForSafe(mLocalAllocs[i]);
-      #endif
-
-      sgIsCollecting = true;
-
-      StopThreadJobs(true);
-      #ifdef HXCPP_DEBUG
-      sgAllocsSinceLastSpam = 0;
-      #endif
-
-      HX_STACK_FRAME("GC", "collect", 0, "GC::collect", __FILE__, __LINE__,0)
-      #ifdef SHOW_MEM_EVENTS
-      int here = 0;
-      GCLOG("=== Collect === %p\n",&here);
-      #endif
-
-
-      #ifdef PROFILE_THREAD_USAGE
-      GCLOG("Thread zero waits %d/%d/%d, misses=%d, hits=%d\n", sThreadZeroPokes, sThreadZeroWaits, mFreeBlocks.size(), sThreadZeroMisses, sThreadBlockZeroCount);
-      sThreadZeroWaits = 0;
-      sThreadZeroPokes = 0;
-      sThreadZeroMisses = 0;
-      sThreadBlockZeroCount = 0;
-      #endif
-
-
-
-      #ifdef HXCPP_TELEMETRY
-      __hxt_gc_start();
-      #endif
-
-      size_t freeFraggedRows = 0; 
-      if (inFreeIsFragged)
-      {
-         for(int i=mNextFreeBlockOfSize[0]; i<mFreeBlocks.size(); i++)
-            freeFraggedRows += mFreeBlocks[i]->GetFreeRows();
-      }
-
-      // Now all threads have mTopOfStack & mBottomOfStack set.
-      bool generational = false; 
-      int strict = sStrictMinorRequested; sStrictMinorRequested = 0;
-
-      #ifdef HXCPP_GC_GENERATIONAL
-      bool compactSurviors = false;
-
-      if (sGcMode==gcmGenerational)
-      {
-         for(int i=0;i<mLocalAllocs.size();i++)
-         {
-            hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
-            if( ctx->mOldReferrers->count )
-                hx::sGlobalChunks.addLocked( ctx->mOldReferrers );
-            else
-                hx::sGlobalChunks.free( ctx->mOldReferrers );
-            ctx->mOldReferrers = 0;
-         }
-      }
-
-      hx::QuickVec<hx::Object *> rememberedSet;
-      generational = !inMajor && !inForceCompact && (sGcMode == gcmGenerational || strict);
-      if (sGcMode==gcmGenerational)
-      {
-         hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
-         #ifdef SHOW_MEM_EVENTS
-         GCLOG("Patch remembered set marks %d\n", rememberedSet.size());
-         #endif
-         for(int i=0;i<rememberedSet.size();i++)
-            ((unsigned char *)rememberedSet[i])[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
-      }
-      #endif
-
-      STAMP(t1)
-
-      MarkAll(generational);
-
-      #ifdef HX_GC_VERIFY_GENERATIONAL
-      {
-         #ifdef SHOW_MEM_EVENTS
-         GCLOG("verify generational [\n");
-         #endif
-         sGcVerifyGenerational = true;
-         sgTimeToNextTableUpdate--;
-         MarkAll(false);
-         sGcVerifyGenerational = false;
-         #ifdef SHOW_MEM_EVENTS
-         GCLOG("] verify generational\n");
-         #endif
-      }
-      #endif
-
-      STAMP(t2)
-
-
-      // Sweep blocks
-
-      // Update table entries?  This needs to be done before the gMarkID count clocks
-      //  back to the same number
-      if (!generational)
-         sgTimeToNextTableUpdate--;
-
-      bool full = inMajor || inForceCompact || (!strict && (sgTimeToNextTableUpdate<=0));
-
-      // Setup memory target ...
-      // Count free rows, and prep blocks for sorting
-      BlockDataStats stats;
-
-      /*
-       This reduces the stall time, but adds a bit of background cpu usage
-       Might be good to just countRows for non-generational too
-      */
-      if (!full && generational)
-      {
-         countRows(stats);
-         size_t currentRows = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
-         double filled = (double)(currentRows) / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
-         if (filled>0.9)
-         {
-            // Failure of generational estimation
-            int retained = currentRows - mRowsInUse;
-            int space = mAllBlocks.size()*IMMIX_USEFUL_LINES - mRowsInUse;
-            if (space<retained)
-               space = retained;
-            if (space<1)
-               space = 1;
-            mGenerationalRetainEstimate = (double)retained/(double)space;
-            #ifdef SHOW_MEM_EVENTS
-            GCLOG("Generational retention/fragmentation too high %f, do normal collect\n", mGenerationalRetainEstimate);
-            #endif
-
-            #ifdef HX_GC_VERIFY_ALLOC_START
-            verifyAllocStart();
-            #endif
-
-            generational = false;
-            MarkAll(generational);
-
-            sgTimeToNextTableUpdate--;
-            full = sgTimeToNextTableUpdate<=0;
-
-            stats.clear();
-            reclaimBlocks(full,stats);
-         }
-      }
-      else
-      {
-         reclaimBlocks(full,stats);
-      }
-
-
-      #ifdef HXCPP_GC_GENERATIONAL
-      if (compactSurviors)
-      {
-         MoveSurvivors(&rememberedSet);
-      }
-      #endif
-
-
-      #ifdef HXCPP_GC_MOVING
-      if (!full)
-      {
-         double useRatio = (double)(mRowsInUse<<IMMIX_LINE_BITS) / (sWorkingMemorySize);
-         #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
-            GCLOG("Row use ratio:%f\n", useRatio);
-         #endif
-         // Could be either expanding, or fragmented...
-         if (useRatio>0.85)
-         {
-            #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
-               GCLOG("Do full stats\n", useRatio);
-            #endif
-            full = true;
-            stats.clear();
-            reclaimBlocks(full,stats);
-         }
-      }
-      #endif
-
-      if (full)
-      {
-         #ifdef HXCPP_GC_MOVING
-         sgTimeToNextTableUpdate = 7;
-         #else
-         sgTimeToNextTableUpdate = 15;
-         #endif
-      }
-
-      size_t oldRowsInUse = mRowsInUse;
-      mRowsInUse = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
-
-      // Update survival rate estimate
-      UpdateSurvivalRate(oldRowsInUse);
-      mAllocatedSinceLastGC = 0;
-
-      bool moved = false;
-
-      #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
-      GCLOG("Total memory : %s\n", formatBytes(GetWorkingMemory()).c_str());
-      GCLOG("  reserved bytes : %s\n", formatBytes(mRowsInUse*IMMIX_LINE_LEN).c_str());
-      if (full)
-      {
-         GCLOG("  active bytes   : %s\n", formatBytes(stats.bytesInUse).c_str());
-         GCLOG("  active ratio   : %f\n", (double)stats.bytesInUse/( mRowsInUse*IMMIX_LINE_LEN));
-         GCLOG("  fragged blocks : %d (%.1f%%)\n", stats.fraggedBlocks, stats.fraggedBlocks*100.0/mAllBlocks.size() );
-         GCLOG("  fragged score  : %f\n", (double)stats.fragScore/mAllBlocks.size() );
-      }
-      GCLOG("  large size   : %s\n", formatBytes(mLargeAllocated).c_str());
-      GCLOG("  empty blocks : %d (%.1f%%)\n", stats.emptyBlocks, stats.emptyBlocks*100.0/mAllBlocks.size());
-      #endif
-
-      size_t bytesInUse = mRowsInUse<<IMMIX_LINE_BITS;
-
-      STAMP(t3)
-
-
-      #ifdef HXCPP_TELEMETRY
-      // Detect deallocations - TODO: add STAMP() ?
-      __hxt_gc_after_mark(gByteMarkID, HX_ENDIAN_MARK_ID_BYTE);
-      #endif
-
-      // Sweep large
-
-      // Manage recycle size ?
-      //  clear old frames recycle objects
-      int l2 = largeObjectRecycle.size();
-      for(int i=0;i<largeObjectRecycle.size();i++)
-         HxFree(largeObjectRecycle[i]);
-      largeObjectRecycle.setSize(0);
-
-      size_t recycleRemaining = 0;
-      #ifdef RECYCLE_LARGE
-      if (!inForceCompact)
-         recycleRemaining = mLargeAllocForceRefresh;
-      #endif
-
-      int idx = 0;
-      int l0 = mLargeList.size();
-      while(idx<mLargeList.size())
-      {
-         unsigned int *blob = mLargeList[idx];
-         if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
-         {
-            unsigned int size = *blob;
-            mLargeAllocated -= size;
-            if (size < recycleRemaining)
-            {
-               recycleRemaining -= size;
-               largeObjectRecycle.push(blob);
-            }
-            else
-            {
-               HxFree(blob);
-            }
-
-            mLargeList.qerase(idx);
-         }
-         else
-            idx++;
-      }
-
-      int l1 = mLargeList.size();
-
-
-      STAMP(t4)
-
-      bool defragged = false;
-
-      // Compact/Defrag?
-      #if defined(HXCPP_GC_MOVING) && defined(HXCPP_VISIT_ALLOCS)
-      if (full)
-      {
-         bool doRelease = false;
-
-         if (inForceCompact)
-            doRelease = true;
-         else
-         {
-            size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
-            size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, mem/100 * (size_t)hx::sgTargetFreeSpacePercentage );
-            targetFree = std::min(targetFree, (size_t)sgMaximumFreeSpace );
-            sWorkingMemorySize = std::max( mem + targetFree, (size_t)hx::sgMinimumWorkingMemory);
-
-            size_t allMem = GetWorkingMemory();
-            // 8 Meg too much?
-            size_t allowExtra = std::max( (size_t)8*1024*1024, sWorkingMemorySize*5/4 );
-
-            if ( allMem > sWorkingMemorySize + allowExtra )
-            {
-               #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
-               int releaseGroups = (int)((allMem - sWorkingMemorySize) / (IMMIX_BLOCK_SIZE<<IMMIX_BLOCK_GROUP_BITS));
-               if (releaseGroups)
-                  GCLOG("Try to release %d groups\n", releaseGroups );
-               #endif
-               doRelease = true;
-            }
-         }
-
-
-         bool isFragged = stats.fragScore > mAllBlocks.size()*FRAG_THRESH;
-         if (doRelease || isFragged || hx::gAlwaysMove)
-         {
-            if (isFragged && sgTimeToNextTableUpdate>3)
-               sgTimeToNextTableUpdate = 3;
-            calcMoveOrder( );
-
-            // Borrow some blocks to ensuure space to defrag into
-            int workingBlocks = mAllBlocks.size()*3/2 - stats.emptyBlocks;
-            int borrowed = 0;
-            while( mAllBlocks.size()<workingBlocks )
-            {
-               bool dummy = false;
-               if (!AllocMoreBlocks(dummy, true))
-                  break;
-               doRelease = true;
-               borrowed++;
-            }
-            stats.emptyBlocks += borrowed;
-            #if defined(SHOW_FRAGMENTATION)
-               GCLOG("Borrowed %d groups for %d target blocks\n", borrowed, workingBlocks);
-            #endif
-
-            MoveBlockJob job(mAllBlocks);
-
-            if (MoveBlocks(job,stats) || doRelease)
-            {
-               if (doRelease)
-               {
-                  size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
-                  size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, bytesInUse/100 *hx::sgTargetFreeSpacePercentage );
-                  targetFree = std::min(targetFree, (size_t)sgMaximumFreeSpace );
-                  size_t targetMem = std::max( mem + targetFree, (size_t)hx::sgMinimumWorkingMemory) +
-                                        (2<<(IMMIX_BLOCK_GROUP_BITS+IMMIX_BLOCK_BITS));
-
-                  if (inForceCompact)
-                     targetMem = 0;
-                  size_t have = GetWorkingMemory();
-                  if (targetMem<have)
-                  {
-                     size_t releaseSize = have - targetMem;
-                     #ifdef SHOW_FRAGMENTATION
-                     GCLOG(" Release %s bytes to leave %s\n", formatBytes(releaseSize).c_str(), formatBytes(targetMem).c_str() );
-                     #endif
-
-                     int releasedBlocks = releaseEmptyGroups(stats, releaseSize);
-                     #ifdef SHOW_FRAGMENTATION
-                     int releasedGroups = releasedBlocks >> IMMIX_BLOCK_GROUP_BITS;
-                     GCLOG(" Released %s, %d groups\n", formatBytes((size_t)releasedBlocks<<IMMIX_BLOCK_BITS).c_str(), releasedGroups );
-                     #endif
-                  }
-               }
-
-               // Reduce sWorkingMemorySize now we have defragged
-               #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
-               GCLOG("After compacting---\n");
-               GCLOG("  total memory : %s\n", formatBytes(GetWorkingMemory()).c_str() );
-               GCLOG("  total needed : %s\n", formatBytes((size_t)mRowsInUse*IMMIX_LINE_LEN).c_str() );
-               GCLOG("  for bytes    : %s\n", formatBytes(bytesInUse).c_str() );
-               GCLOG("  empty blocks : %d (%.1f%%)\n", stats.emptyBlocks, stats.emptyBlocks*100.0/mAllBlocks.size());
-               GCLOG("  fragged blocks : %d (%.1f%%)\n", stats.fraggedBlocks, stats.fraggedBlocks*100.0/mAllBlocks.size() );
-               #endif
-            }
-
-            std::stable_sort(&mAllBlocks[0], &mAllBlocks[0] + mAllBlocks.size(), SortByBlockPtr );
-
-            #ifdef HXCPP_GC_VERIFY
-            VerifyBlockOrder();
-            #endif
-         }
-      }
-      #endif
-
-
-      STAMP(t5)
-
-      size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
-      size_t baseMem = full ? bytesInUse : mem;
-      #ifdef HXCPP_GC_DYNAMIC_SIZE
-      size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, (size_t)(baseMem * profileCollectSummary.spaceFactor ) );
-      #else
-      size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, baseMem/100 *hx::sgTargetFreeSpacePercentage );
-      #endif
-      targetFree = std::min(targetFree, (size_t)sgMaximumFreeSpace );
-      // Only adjust if non-generational
-      if (!generational)
-         sWorkingMemorySize = std::max( mem + targetFree, (size_t)hx::sgMinimumWorkingMemory);
-
-      #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
-      GCLOG("Target memory %s, using %s\n",  formatBytes(sWorkingMemorySize).c_str(), formatBytes(mem).c_str() );
-      #endif
-
-      // Large alloc target
-      int blockSize =  mAllBlocks.size()<<IMMIX_BLOCK_BITS;
-      if (blockSize > mLargeAllocSpace)
-         mLargeAllocSpace = blockSize;
-      mLargeAllocForceRefresh = mLargeAllocated + mLargeAllocSpace;
-
-      mTotalAfterLastCollect = MemUsage();
-
-      #ifdef HXCPP_GC_GENERATIONAL
-      if (generational)
-      {
-         // TODO - include large too?
-         int retained = mRowsInUse - oldRowsInUse;
-         int space = mAllBlocks.size()*IMMIX_USEFUL_LINES - oldRowsInUse;
-         if (space<retained)
-            space = retained;
-
-         mGenerationalRetainEstimate = (double)retained/(double)space;
-      }
-      else
-      {
-         // move towards 0.2
-         mGenerationalRetainEstimate += (0.2-mGenerationalRetainEstimate)*0.25;
-      }
-
-      double filled_ratio = (double)mRowsInUse/(double)(mAllBlocksCount*IMMIX_USEFUL_LINES);
-      double after_gen = filled_ratio + (1.0-filled_ratio)*mGenerationalRetainEstimate;
-
-      if (after_gen<0.75)
-      {
-         sGcMode = gcmGenerational;
-      }
-      else
-      {
-         sGcMode = gcmFull;
-         // What was I thinking here?  This breaks #851
-         //gByteMarkID |= 0x30;
-      }
-
-      #ifdef SHOW_MEM_EVENTS
-      GCLOG("filled=%.2f%% + estimate = %.2f%% = %.2f%% -> %s\n",
-            filled_ratio*100, mGenerationalRetainEstimate*100, after_gen*100, sGcMode==gcmFull?"Full":"Generational");
-      #endif
-
-      #endif
-
-      createFreeList();
-
-      // This saves some running/stall time, but increases the total CPU usage
-      // Delaying it until just before the block is used to improve the cache locality
-      backgroundProcessFreeList(true);
-
-      mAllBlocksCount   = mAllBlocks.size();
-      mCurrentRowsInUse = mRowsInUse;
-
-      #ifdef SHOW_MEM_EVENTS
-      GCLOG("Collect Done\n");
-      #endif
-
-      #ifdef PROFILE_COLLECT
-      STAMP(t6)
-      double period = t6-sLastCollect;
-      sLastCollect=t6;
-      GCLOG("Collect time %s total=%.2fms =%.1f%%\n  setup=%.2f\n  %s=%.2f(init=%.2f/roots=%.2f %d+%d/loc=%.2f*%d %d+%d/mark=%.2f %d+%d/fin=%.2f*%d/ids=%.2f)\n  reclaim=%.2f\n  large(%d->%d, recyc %d)=%.2f\n  defrag=%.2f\n",
-               generational ? "gen" : "std",
-              (t6-t0)*1000, (t6-t0)*100.0/period, // total %
-              (t1-t0)*1000, // sync/setup
-              generational ? "mark gen" : "mark", (t2-t1)*1000,
-                      (tMarkInit-t1)*1000,
-                      (tMarkLocal-tMarkInit)*1000,  hx::rootObjects, hx::rootAllocs,
-                      (tMarkLocalEnd-tMarkLocal)*1000, hx::localCount, hx::localObjects-hx::rootObjects, hx::localAllocs-hx::rootAllocs,
-                      (tMarked-tMarkLocalEnd)*1000, sObjectMarks-hx::localObjects, sAllocMarks-hx::localAllocs,
-                      (hx::tFinalizers-tMarked)*1000, hx::finalizerCount,
-                      (t2-hx::tFinalizers)*1000,
-              (t3-t2)*1000, // reclaim
-              l0, l1, l2, (t4-t3)*1000, // large
-              (t5-t4)*1000 // defrag
-              );
-      sObjectMarks = sAllocMarks = 0;
-
-      #endif
-
-      #ifdef PROFILE_THREAD_USAGE
-      GCLOG("Thread chunks:%d, wakes=%d\n", sThreadChunkPushCount, sThreadChunkWakes);
-      for(int i=-1;i<MAX_GC_THREADS;i++)
-        GCLOG(" thread %d] %d + %d\n", i, sThreadMarkCount[i], sThreadArrayMarkCount[i]);
-      GCLOG("Locking spins  : %d\n", sSpinCount);
-      sSpinCount = 0;
-      #endif
-
-      #ifdef HXCPP_GC_GENERATIONAL
-      if (sGcMode==gcmGenerational)
-         for(int i=0;i<mLocalAllocs.size();i++)
-         {
-            hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
-            ctx->mOldReferrers = hx::sGlobalChunks.alloc();
-         }
-      #endif
-
-
-      #ifdef HXCPP_GC_VERIFY
-      VerifyBlockOrder();
-      #endif
-
-      for(int i=0;i<LOCAL_POOL_SIZE;i++)
-      {
-         LocalAllocator *l = mLocalPool[i];
-         if (l)
-            ClearPooledAlloc(l);
-      }
-
-      #ifdef HXCPP_TELEMETRY
-      __hxt_gc_end();
-      #endif
-
-      sgIsCollecting = false;
-
-
-      hx::gPauseForCollect = 0x00000000;
-      #ifndef HXCPP_SINGLE_THREADED_APP
-         for(int i=0;i<mLocalAllocs.size();i++)
-         {
-            #ifdef HXCPP_SCRIPTABLE
-            ((hx::StackContext *)mLocalAllocs[i])->byteMarkId = hx::gByteMarkID;
-            #endif
-            if (mLocalAllocs[i]!=this_local)
-               ReleaseFromSafe(mLocalAllocs[i]);
-         }
-
-         if (!inLocked)
-            gThreadStateChangeLock->Unlock();
-      #else
-        #ifdef HXCPP_SCRIPTABLE
-        hx::gMainThreadContext->byteMarkId = hx::gByteMarkID;
-        #endif
-      #endif
-
-
-      PROFILE_COLLECT_SUMMARY_END;
-   }
+   void Collect(bool inMajor, bool inForceCompact, bool inLocked,bool inFreeIsFragged);
 
    void reclaimBlocks(bool full, BlockDataStats &outStats)
    {
@@ -5932,6 +5250,24 @@ public:
       return false;
    }
 
+   bool IsValidPointer(void *inPtr)
+   {
+      if (!inPtr) return false;
+      if ((size_t)inPtr & 3) return false;
+
+      // Try large objects first as they are fewer
+      for(int i=0;i<mLargeList.size();i++)
+      {
+         unsigned int *blob = mLargeList[i] + 2;
+         if (blob==inPtr) return true;
+      }
+
+      BlockData *block = (BlockData *)( ((size_t)inPtr) & IMMIX_BLOCK_BASE_MASK);
+      if (IsAllBlock(block)) return true;
+
+      return false;
+   }
+
    MemType GetMemType(void *inPtr)
    {
       BlockData *block = (BlockData *)( ((size_t)inPtr) & IMMIX_BLOCK_BASE_MASK);
@@ -5992,7 +5328,260 @@ public:
    hx::QuickVec<LocalAllocator *> mLocalAllocs;
    LocalAllocator *mLocalPool[LOCAL_POOL_SIZE];
    hx::QuickVec<unsigned int *> largeObjectRecycle;
+
+   void SafeMarkObjectAlloc(hx::Object *obj, hx::MarkContext *ctx)
+   {
+      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+      __try {
+          if (obj && IsValidPointer(obj)) hx::MarkObjectAlloc(obj, ctx);
+      }
+      __except(1) {
+          GCLOG("Warning: SEH Exception during MarkObjectAlloc on %p\n", obj);
+      }
+      #else
+      if (obj && IsValidPointer(obj)) 
+          hx::MarkObjectAlloc(obj, ctx);
+      #endif
+   }
+
+   void SafeMarkClassStatics(hx::MarkContext *ctx)
+   {
+      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+      __try {
+          hx::MarkClassStatics(ctx);
+      }
+      __except(1) {
+          GCLOG("Warning: SEH Exception during MarkClassStatics\n");
+      }
+      #else
+      hx::MarkClassStatics(ctx);
+      #endif
+   }
+
+   void SafeMarkLocalAlloc(LocalAllocator *alloc, hx::MarkContext *ctx)
+   {
+      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+      __try {
+          MarkLocalAlloc(alloc, ctx);
+      }
+      __except(1) {
+          GCLOG("Warning: SEH Exception during MarkLocalAlloc on allocator %p\n", alloc);
+      }
+      #else
+      MarkLocalAlloc(alloc, ctx);
+      #endif
+   }
+
+   void SafeMarkObjectArray(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx)
+   {
+      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+      __try {
+          MarkObjectArray(inPtr, inLength, __inCtx);
+      }
+      __except(1) {
+          GCLOG("Warning: SEH Exception during MarkObjectArray\n");
+      }
+      #else
+      MarkObjectArray(inPtr, inLength, __inCtx);
+      #endif
+   }
+
+   void CheckLargeObjectSafe(unsigned int *blob)
+   {
+      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+      __try {
+          if (blob && (blob[1] & IMMIX_ALLOC_MARK_ID) == hx::gMarkID )
+          {
+          }
+      }
+      __except(1) {
+          GCLOG("Warning: SEH Exception checking LargeObject %p\n", blob);
+      }
+      #else
+      if (blob && (blob[1] & IMMIX_ALLOC_MARK_ID) == hx::gMarkID )
+      {
+      }
+      #endif
+   }
+
+   void CheckGenerationalReferrersSafe(hx::StackContext *ctx, hx::MarkContext *marker, int threadIdx)
+   {
+      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+      __try {
+      #endif
+          if (ctx->mOldReferrers && ctx->mOldReferrers->count)
+          {
+             hx::Object **ref = ctx->mOldReferrers->stack;
+             int n = ctx->mOldReferrers->count;
+             if (n < 0 || n > 10000000) 
+             {
+                 GCLOG("Warning: Suspicious referrer count %d, skipping.\n", n);
+                 return;
+             }
+
+             for(int r=0;r<n;r++)
+             {
+                hx::Object *obj = ref[r];
+                if (obj && !((size_t)obj & 3))
+                   SafeMarkObjectAlloc(obj, marker);
+             }
+          }
+      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+      }
+      __except(1) {
+          GCLOG("Warning: SEH Exception checking Generational Referrers for thread %d\n", threadIdx);
+      }
+      #endif
+   }
+
+   void MarkRememberedSet(hx::QuickVec<hx::Object *> *inSet, hx::MarkContext *__inCtx)
+   {
+       if (!inSet) return;
+       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+       __try {
+       #endif
+           for(int i=0;i<inSet->size();i++)
+           {
+              hx::Object *obj = (*inSet)[i];
+              // Bypass MarkObjectAlloc check because these are Old objects that we MUST scan
+              if (obj && !((size_t)obj & 3))
+                 obj->__Mark(__inCtx);
+           }
+       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+       }
+       __except(1) {
+           GCLOG("Warning: SEH Exception during MarkRememberedSet\n");
+       }
+       #endif
+   }
+
+   void MarkRoots(hx::MarkContext *__inCtx)
+   {
+      hx::AutoMarkPush info(__inCtx,"Roots","root");
+
+      for(hx::RootSet::iterator i = hx::sgRootSet.begin(); i!=hx::sgRootSet.end(); ++i)
+      {
+         hx::Object *&obj = **i;
+         SafeMarkObjectAlloc(obj , __inCtx );
+      }
+
+      if (hx::sgOffsetRootSet)
+         for(hx::OffsetRootSet::iterator i = hx::sgOffsetRootSet->begin(); i!=hx::sgOffsetRootSet->end(); ++i)
+         {
+            char *ptr = *(char **)(i->first);
+            int offset = i->second;
+            hx::Object *obj = (hx::Object *)(ptr - offset);
+
+            SafeMarkObjectAlloc(obj , __inCtx );
+         }
+   }
+
+   void MarkZombies(hx::MarkContext *__inCtx)
+   {
+      hx::AutoMarkPush info(__inCtx,"Zombies","zombie");
+      // Mark zombies too....
+      for(int i=0;i<hx::sZombieList.size();i++)
+         SafeMarkObjectAlloc(hx::sZombieList[i] , __inCtx );
+   }
+
+   void FindZombiesSafe(hx::MarkContext *__inCtx)
+   {
+       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+       __try {
+           hx::FindZombies(*__inCtx);
+       }
+       __except(1) {
+           GCLOG("Warning: SEH Exception during FindZombies\n");
+       }
+       #else
+       hx::FindZombies(*__inCtx);
+       #endif
+   }
+
+   void RunFinalizersSafe()
+   {
+       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+       __try {
+           hx::RunFinalizers();
+       }
+       __except(1) {
+           GCLOG("Warning: SEH Exception during RunFinalizers\n");
+       }
+       #else
+       hx::RunFinalizers();
+       #endif
+   }
 };
+
+inline void hx::MarkContext::processMarkStack()
+{
+   while(true)
+   {
+      if (!marking || !marking->count)
+      {
+         #ifdef HX_MULTI_THREAD_MARKING
+         if (sgThreadPoolAbort)
+         {
+            releaseJobs();
+            return;
+         }
+         #endif
+
+         marking = sGlobalChunks.popJobOrFinish(marking,mThreadId);
+         if (!marking)
+            break;
+
+         if (marking->count==MarkChunk::OBJ_ARRAY_JOB)
+         {
+            int n = marking->arrayElements;
+            hx::Object **elems = marking->arrayBase;
+            marking->count = 0;
+            sGlobalAlloc->SafeMarkObjectArray(elems, n, this);
+            continue;
+         }
+      }
+
+      while(marking)
+      {
+         hx::Object *obj = marking->pop();
+         if (obj)
+         {
+            #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+            __try {
+                if (sGlobalAlloc->IsValidPointer(obj))
+                    obj->__Mark(this);
+            }
+            __except(1) {
+                 GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
+            }
+            #else
+            if (sGlobalAlloc->IsValidPointer(obj))
+                obj->__Mark(this);
+            #endif
+
+            #if HX_MULTI_THREAD_MARKING
+            // Load balance
+            if (sLazyThreads && marking->count>32)
+            {
+               MarkChunk *c = sGlobalChunks.alloc();
+               if (c)
+               {
+                  marking->count -= 16;
+                  c->count = 16;
+                  memcpy( c->stack, marking->stack + marking->count, 16*sizeof(hx::Object *));
+                  sGlobalChunks.pushJob(c,false);
+               }
+            }
+            #ifdef PROFILE_THREAD_USAGE
+            sThreadMarkCount[mThreadId]++;
+            #endif
+            #endif
+         }
+         else
+            break;
+      }
+   }
+}
 
 
 
@@ -6193,7 +5782,11 @@ class LocalAllocator : public hx::StackContext
    bool            mGCFreeZone;
    HxSemaphore     mReadyForCollect;
    HxSemaphore     mCollectDone;
-   #endif
+   #ifdef HX_WINDOWS
+    HANDLE          mSuspendedThread;
+    CONTEXT         mSuspendedContext;
+    #endif
+    #endif
 
    int             mID;
 
@@ -6207,16 +5800,14 @@ public:
    bool            mGlobalStackLock;
    int             mStackLocks;
    size_t          mBytesAllocatedSinceGC;
-   size_t          mContainerBytesAllocatedSinceGC;
-   size_t          mDataBytesAllocatedSinceGC;
+   bool            mIsCollecting;
 
 public:
    LocalAllocator(int *inTopOfStack=0)
    {
+      mIsCollecting = false;
       Reset();
       mBytesAllocatedSinceGC = 0;
-      mContainerBytesAllocatedSinceGC = 0;
-      mDataBytesAllocatedSinceGC = 0;
 
       #ifdef HXCPP_GC_GENERATIONAL
       mOldReferrers = 0;
@@ -6237,6 +5828,7 @@ public:
       mGlobalStackLock = false;
       #ifdef HX_WINDOWS
       mID = GetCurrentThreadId();
+      mSuspendedThread = 0;
       #endif
 
       #ifdef HXCPP_GC_GENERATIONAL
@@ -6437,6 +6029,8 @@ public:
    void PauseForCollect()
    {
       #ifndef HXCPP_SINGLE_THREADED_APP
+      if (mIsCollecting) return;
+
       volatile int dummy = 1;
       mBottomOfStack = (int *)&dummy;
       CAPTURE_REGS;
@@ -6549,29 +6143,41 @@ public:
                   CONTEXT ctx;
                   memset(&ctx, 0, sizeof(ctx));
                   #if defined(_M_X64)
-                  ctx.ContextFlags = CONTEXT_CONTROL;
+                  ctx.ContextFlags = CONTEXT_FULL;
                   if (GetThreadContext(hThread, &ctx))
                   {
                      int *bottom = (int *)(ctx.Rsp);
                      mBottomOfStack = bottom;
+                     mSuspendedContext = ctx;
                   }
                   #else
-                  ctx.ContextFlags = CONTEXT_CONTROL;
+                  ctx.ContextFlags = CONTEXT_FULL;
                   if (GetThreadContext(hThread, &ctx))
                   {
                      int *bottom = (int *)(ctx.Esp);
                      mBottomOfStack = bottom;
+                     mSuspendedContext = ctx;
                   }
                   #endif
-                  ResumeThread(hThread);
+                  mSuspendedThread = hThread;
                }
-               CloseHandle(hThread);
-               mReadyForCollect.Set();
-               return;
+               else
+               {
+                  CloseHandle(hThread);
+               }
+               
+               if (mSuspendedThread)
+               {
+                  return;
+               }
             }
-            #endif
-         }
-         // Cause allocation routines to fail ...
+            #else
+            // POSIX: Use signals to suspend threads and capture context
+         #if defined(HX_LINUX) || defined(HX_ANDROID) || defined(HX_MACOS) || defined(HX_IOS)
+         #endif
+         #endif
+      }
+      // Cause allocation routines to fail ...
          mMoreHoles = false;
          #ifdef HXCPP_GC_NURSERY
          spaceOversize = 0;
@@ -6587,7 +6193,19 @@ public:
    {
       #ifndef HXCPP_SINGLE_THREADED_APP
       if (!mGCFreeZone)
-         mCollectDone.Set();
+      {
+         #ifdef HX_WINDOWS
+         if (mSuspendedThread)
+         {
+            // First resume, then close handle to avoid race conditions or invalid handle usage
+            ResumeThread(mSuspendedThread);
+            CloseHandle(mSuspendedThread);
+            mSuspendedThread = 0;
+         }
+         else
+         #endif
+            mCollectDone.Set();
+      }
       #endif
    }
 
@@ -6597,8 +6215,6 @@ public:
    void SetupStackAndCollect(bool inMajor, bool inForceCompact, bool inLocked=false,bool inFreeIsFragged=false)
    {
       mBytesAllocatedSinceGC = 0;
-      mContainerBytesAllocatedSinceGC = 0;
-      mDataBytesAllocatedSinceGC = 0;
       #ifndef HXCPP_SINGLE_THREADED_APP
         #if HXCPP_DEBUG
         if (mGCFreeZone)
@@ -6615,7 +6231,7 @@ public:
       if (!mTopOfStack)
          mTopOfStack = mBottomOfStack;
 
-      // EMSCRIPTEN the stack grows upwards
+      // Ensure stack consistency for scanning
       #ifdef HXCPP_STACK_UP
       if (mBottomOfStack < mTopOfStack)
          mTopOfStack = mBottomOfStack;
@@ -6666,7 +6282,7 @@ public:
       if (mGCFreeZone)
          CriticalGCError("Allocating from a GC-free thread");
       #endif
-      if (hx::gPauseForCollect)
+      if (hx::gPauseForCollect && !mIsCollecting)
          PauseForCollect();
       #endif
 
@@ -6701,10 +6317,6 @@ public:
                int size = allocSize - 4;
                ((unsigned int *)buffer)[-1] = size | inObjectFlags;
                mBytesAllocatedSinceGC += size;
-               if (inObjectFlags & IMMIX_ALLOC_IS_CONTAINER)
-                  mContainerBytesAllocatedSinceGC += size;
-               else
-                  mDataBytesAllocatedSinceGC += size;
 
                #if defined(HXCPP_GC_CHECK_POINTER) && defined(HXCPP_GC_DEBUG_ALWAYS_MOVE)
                hx::GCOnNewPointer(buffer);
@@ -6738,10 +6350,6 @@ public:
                spaceStart = end;
 
                mBytesAllocatedSinceGC += inSize;
-               if (inObjectFlags & IMMIX_ALLOC_IS_CONTAINER)
-                  mContainerBytesAllocatedSinceGC += inSize;
-               else
-                  mDataBytesAllocatedSinceGC += inSize;
 
                #if defined(HXCPP_GC_CHECK_POINTER) && defined(HXCPP_GC_DEBUG_ALWAYS_MOVE)
                hx::GCOnNewPointer(buffer);
@@ -6783,6 +6391,14 @@ public:
             //CAPTURE_REGS;
 
             BlockDataInfo *info = sGlobalAlloc->GetFreeBlock(allocSize,this);
+            if (!info)
+            {
+               // Before returning 0, try to collect one last time in full mode if we were in generational mode
+               // This handles the edge case where generational GC fails to reclaim enough but full GC would.
+               // But GetFreeBlock already does this internally.
+               // If we are here, we are truly out of memory.
+               return 0;
+            }
 
             allocBase = (unsigned char *)info->mPtr;
             mCurrentRange = info->mRanges;
@@ -6851,7 +6467,28 @@ public:
            hx::MarkConservative( (int *)emscripten_stack_get_current(),(int *)emscripten_stack_get_base(), __inCtx);
          #else
          if (mTopOfStack && mBottomOfStack)
-            hx::MarkConservative(mBottomOfStack, mTopOfStack , __inCtx);
+         {
+             // Ensure stack range is valid before scanning
+             int *start = mBottomOfStack;
+             int *end = mTopOfStack;
+             if (start > end) { int *t = start; start = end; end = t; }
+             
+             // Extra safety: validate pointer alignment and bounds
+             // Align start to 4 bytes
+             start = (int *)((size_t)start & ~(size_t)3);
+             
+             // Don't scan impossibly large stacks which might indicate corruption
+             // Limit stack scan to 8MB per thread to prevent segfaults on bad pointers
+             size_t size = (char*)end - (char*)start;
+             if (size > 0 && size < 8*1024*1024) 
+             {
+                 hx::MarkConservative(start, end , __inCtx);
+             }
+             else
+             {
+                 GCLOG("Warning: Skipping stack scan due to invalid size: %p - %p (%d bytes)\n", start, end, size);
+             }
+         }
          #endif
 
          #ifdef HXCPP_SCRIPTABLE
@@ -6859,6 +6496,13 @@ public:
             hx::MarkConservative((int *)(stack), (int *)(pointer),__inCtx);
          #endif
          MarkSetMember("Registers",__inCtx);
+         #ifdef HX_WINDOWS
+         if (mSuspendedThread)
+         {
+            hx::MarkConservative((int *)&mSuspendedContext, (int *)((char *)&mSuspendedContext + sizeof(mSuspendedContext)), __inCtx);
+         }
+         else
+         #endif
          hx::MarkConservative(CAPTURE_REG_START, CAPTURE_REG_END, __inCtx);
 
 
@@ -6869,7 +6513,28 @@ public:
            hx::MarkConservative( (int *)emscripten_stack_get_current(), (int *) emscripten_stack_get_base(), __inCtx);
          #else
             if (mTopOfStack && mBottomOfStack)
-               hx::MarkConservative(mBottomOfStack, mTopOfStack , __inCtx);
+            {
+                // Ensure stack range is valid before scanning
+                int *start = mBottomOfStack;
+                int *end = mTopOfStack;
+                if (start > end) { int *t = start; start = end; end = t; }
+
+                // Extra safety: validate pointer alignment and bounds
+                start = (int *)((size_t)start & ~(size_t)3);
+                
+                size_t size = (char*)end - (char*)start;
+                if (size > 0 && size < 8*1024*1024) 
+                {
+                    hx::MarkConservative(start, end , __inCtx);
+                }
+            }
+            #ifdef HX_WINDOWS
+            if (mSuspendedThread)
+            {
+               hx::MarkConservative((int *)&mSuspendedContext, (int *)((char *)&mSuspendedContext + sizeof(mSuspendedContext)), __inCtx);
+            }
+            else
+            #endif
             hx::MarkConservative(CAPTURE_REG_START, CAPTURE_REG_END, __inCtx);
          #endif
 
@@ -6891,6 +6556,720 @@ public:
 
 
 
+
+BlockDataInfo *GlobalAllocator::GetFreeBlock(int inRequiredBytes, hx::ImmixAllocator *inAlloc)
+{
+   while(true)
+   {
+      BlockDataInfo *result = GetNextFree(inRequiredBytes);
+      if (result)
+      {
+         result->zeroAndUnlock();
+
+         // After zero/reclaim, it might be that the hole size is smaller than we thought.
+         if (result->mMaxHoleSize>=inRequiredBytes)
+            return result;
+
+         repoolReclaimedBlock(result);
+         continue;
+      }
+
+      if (hx::gPauseForCollect)
+      {
+         if (!((LocalAllocator *)inAlloc)->mIsCollecting)
+         {
+            hx::PauseForCollect();
+            continue;
+         }
+      }
+
+      #ifndef HXCPP_SINGLE_THREADED_APP
+      hx::EnterGCFreeZone();
+      EnsureThreadStateChangeLock().Lock();
+      hx::ExitGCFreeZoneLocked();
+
+      result = GetNextFree(inRequiredBytes);
+      #endif
+
+      bool forceCompact = false;
+      if (!result && allowMoreBlocks() && (!sgInternalEnable || GetWorkingMemory()<sWorkingMemorySize))
+      {
+         if (AllocMoreBlocks(forceCompact,false))
+            result = GetNextFree(inRequiredBytes);
+      }
+
+      if (((LocalAllocator *)inAlloc)->mIsCollecting)
+      {
+          if (result)
+          {
+              result->zeroAndUnlock();
+              if (result->mMaxHoleSize>=inRequiredBytes)
+                 return result;
+              repoolReclaimedBlock(result);
+              continue;
+          }
+          // Failed to allocate during collection
+          GCLOG("Memory exhausted during collection.\n");
+          DebuggerTrap();
+          return 0;
+      }
+
+      if (!result)
+      {
+         inAlloc->SetupStackAndCollect(false,forceCompact,true,true);
+         result = GetNextFree(inRequiredBytes);
+      }
+
+      if (!result && !forceCompact)
+      {
+         // Try with compact this time...
+         forceCompact = true;
+         inAlloc->SetupStackAndCollect(false,forceCompact,true,true);
+         result = GetNextFree(inRequiredBytes);
+      }
+
+      if (!result)
+      {
+         if (AllocMoreBlocks(forceCompact,false))
+            result = GetNextFree(inRequiredBytes);
+      }
+
+      if (!result)
+      {
+         GCLOG("Memory exhausted.\n");
+         #ifndef HXCPP_M64
+         GCLOG(" try 64 bit build.\n");
+         #endif
+         #ifndef HXCPP_GC_BIG_BLOCKS
+         GCLOG(" try HXCPP_GC_BIG_BLOCKS.\n");
+         #endif
+         DebuggerTrap();
+         return 0;
+      }
+
+      // Assume all wil be used
+      mCurrentRowsInUse += result->GetFreeRows();
+
+      #ifndef HXCPP_SINGLE_THREADED_APP
+      EnsureThreadStateChangeLock().Unlock();
+      #endif
+
+
+      result->zeroAndUnlock();
+
+      // After zero/reclaim, it might be that the hole size is smaller than we thought.
+      if (result->mMaxHoleSize>=inRequiredBytes)
+         return result;
+
+      repoolReclaimedBlock(result);
+   }
+}
+
+void GlobalAllocator::Collect(bool inMajor, bool inForceCompact, bool inLocked,bool inFreeIsFragged)
+{
+   PROFILE_COLLECT_SUMMARY_START;
+
+   #ifndef HXCPP_SINGLE_THREADED_APP
+   // If we set the flag from 0 -> 0xffffffff then we are the collector
+   //  otherwise, someone else is collecting at the moment - so wait...
+   if (_hx_atomic_compare_exchange((volatile int *)&hx::gPauseForCollect, 0, 0xffffffff) != 0)
+   {
+      if (inLocked)
+      {
+         gThreadStateChangeLock->Unlock();
+
+         hx::PauseForCollect();
+
+         hx::EnterGCFreeZone();
+         EnsureThreadStateChangeLock().Lock();
+         hx::ExitGCFreeZoneLocked();
+      }
+      else
+      {
+         hx::PauseForCollect();
+      }
+      return;
+   }
+   #endif
+
+   STAMP(t0)
+
+   // We are the collector - all must wait for us
+   LocalAllocator *this_local = 0;
+   #ifndef HXCPP_SINGLE_THREADED_APP
+   this_local = (LocalAllocator *)(hx::ImmixAllocator *)hx::tlsStackContext;
+
+   if (!inLocked)
+      gThreadStateChangeLock->Lock();
+
+   for(int i=0;i<mLocalAllocs.size();i++)
+      if (mLocalAllocs[i]!=this_local)
+         WaitForSafe(mLocalAllocs[i]);
+   #endif
+
+   sgIsCollecting = true;
+   if (this_local)
+      this_local->mIsCollecting = true;
+
+   StopThreadJobs(true);
+   #ifdef HXCPP_DEBUG
+   sgAllocsSinceLastSpam = 0;
+   #endif
+
+   HX_STACK_FRAME("GC", "collect", 0, "GC::collect", __FILE__, __LINE__,0)
+   #ifdef SHOW_MEM_EVENTS
+   int here = 0;
+   GCLOG("=== Collect === %p\n",&here);
+   #endif
+
+
+   #ifdef PROFILE_THREAD_USAGE
+   GCLOG("Thread zero waits %d/%d/%d, misses=%d, hits=%d\n", sThreadZeroPokes, sThreadZeroWaits, mFreeBlocks.size(), sThreadZeroMisses, sThreadBlockZeroCount);
+   sThreadZeroWaits = 0;
+   sThreadZeroPokes = 0;
+   sThreadZeroMisses = 0;
+   sThreadBlockZeroCount = 0;
+   #endif
+
+
+
+   #ifdef HXCPP_TELEMETRY
+   __hxt_gc_start();
+   #endif
+
+   size_t freeFraggedRows = 0; 
+   if (inFreeIsFragged)
+   {
+      for(int i=mNextFreeBlockOfSize[0]; i<mFreeBlocks.size(); i++)
+         freeFraggedRows += mFreeBlocks[i]->GetFreeRows();
+   }
+
+   // Now all threads have mTopOfStack & mBottomOfStack set.
+   bool generational = false; 
+   int strict = sStrictMinorRequested; sStrictMinorRequested = 0;
+   hx::QuickVec<hx::Object *> *rememberedSetPtr = 0;
+
+   #ifdef HXCPP_GC_GENERATIONAL
+   bool compactSurviors = false;
+
+   if (sGcMode==gcmGenerational)
+   {
+      for(int i=0;i<mLocalAllocs.size();i++)
+      {
+         hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
+         if( ctx->mOldReferrers->count )
+             hx::sGlobalChunks.addLocked( ctx->mOldReferrers );
+         else
+             hx::sGlobalChunks.free( ctx->mOldReferrers );
+         ctx->mOldReferrers = 0;
+      }
+   }
+
+   hx::QuickVec<hx::Object *> rememberedSet;
+   rememberedSetPtr = &rememberedSet;
+   generational = !inMajor && !inForceCompact && (sGcMode == gcmGenerational || strict);
+   if (sGcMode==gcmGenerational)
+   {
+      hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
+      #ifdef SHOW_MEM_EVENTS
+      GCLOG("Patch remembered set marks %d\n", rememberedSet.size());
+      #endif
+      for(int i=0;i<rememberedSet.size();i++)
+         ((unsigned char *)rememberedSet[i])[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+   }
+   #endif
+
+   STAMP(t1)
+
+   MarkAll(generational, rememberedSetPtr);
+
+   #ifdef HX_GC_VERIFY_GENERATIONAL
+      {
+         #ifdef SHOW_MEM_EVENTS
+         GCLOG("verify generational [\n");
+         #endif
+         sGcVerifyGenerational = true;
+         sgTimeToNextTableUpdate--;
+         MarkAll(false, rememberedSetPtr);
+         sGcVerifyGenerational = false;
+         #ifdef SHOW_MEM_EVENTS
+         GCLOG("] verify generational\n");
+         #endif
+      }
+      #endif
+
+   STAMP(t2)
+
+
+   // Sweep blocks
+
+   // Update table entries?  This needs to be done before the gMarkID count clocks
+   //  back to the same number
+   if (!generational)
+      sgTimeToNextTableUpdate--;
+
+   bool full = inMajor || inForceCompact || (!strict && (sgTimeToNextTableUpdate<=0));
+
+   // Setup memory target ...
+   // Count free rows, and prep blocks for sorting
+   BlockDataStats stats;
+
+   /*
+    This reduces the stall time, but adds a bit of background cpu usage
+    Might be good to just countRows for non-generational too
+   */
+   if (!full && generational)
+   {
+      countRows(stats);
+      size_t currentRows = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
+      double filled = (double)(currentRows) / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
+      if (filled>0.9)
+      {
+         // Failure of generational estimation
+         int retained = currentRows - mRowsInUse;
+         int space = mAllBlocks.size()*IMMIX_USEFUL_LINES - mRowsInUse;
+         if (space<retained)
+            space = retained;
+         if (space<1)
+            space = 1;
+         mGenerationalRetainEstimate = (double)retained/(double)space;
+         #ifdef SHOW_MEM_EVENTS
+         GCLOG("Generational retention/fragmentation too high %f, continuing generational collect\n", mGenerationalRetainEstimate);
+         #endif
+
+         // Do NOT fall back to full GC, but DO continue with the current generational collection.
+         // This ensures we at least reclaim what we can from the nursery/young generation,
+         // without incurring the cost and risk of a full GC mode switch.
+      }
+   }
+
+   reclaimBlocks(full,stats);
+
+
+   #ifdef HXCPP_GC_GENERATIONAL
+   if (compactSurviors)
+   {
+      MoveSurvivors(&rememberedSet);
+   }
+   #endif
+
+
+   #ifdef HXCPP_GC_MOVING
+   if (!full)
+   {
+      double useRatio = (double)(mRowsInUse<<IMMIX_LINE_BITS) / (sWorkingMemorySize);
+      #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
+         GCLOG("Row use ratio:%f\n", useRatio);
+      #endif
+      // Could be either expanding, or fragmented...
+      if (useRatio>0.85)
+      {
+         #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
+            GCLOG("Do full stats\n", useRatio);
+         #endif
+         full = true;
+         stats.clear();
+         reclaimBlocks(full,stats);
+      }
+   }
+   #endif
+
+   if (full)
+   {
+      #ifdef HXCPP_GC_MOVING
+      sgTimeToNextTableUpdate = 7;
+      #else
+      sgTimeToNextTableUpdate = 15;
+      #endif
+   }
+
+   size_t oldRowsInUse = mRowsInUse;
+   mRowsInUse = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
+
+   // Update survival rate estimate
+   UpdateSurvivalRate(oldRowsInUse);
+   mAllocatedSinceLastGC = 0;
+
+   bool moved = false;
+
+   #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
+   GCLOG("Total memory : %s\n", formatBytes(GetWorkingMemory()).c_str());
+   GCLOG("  reserved bytes : %s\n", formatBytes(mRowsInUse*IMMIX_LINE_LEN).c_str());
+   if (full)
+   {
+      GCLOG("  active bytes   : %s\n", formatBytes(stats.bytesInUse).c_str());
+      GCLOG("  active ratio   : %f\n", (double)stats.bytesInUse/( mRowsInUse*IMMIX_LINE_LEN));
+      GCLOG("  fragged blocks : %d (%.1f%%)\n", stats.fraggedBlocks, stats.fraggedBlocks*100.0/mAllBlocks.size() );
+      GCLOG("  fragged score  : %f\n", (double)stats.fragScore/mAllBlocks.size() );
+   }
+   GCLOG("  large size   : %s\n", formatBytes(mLargeAllocated).c_str());
+   GCLOG("  empty blocks : %d (%.1f%%)\n", stats.emptyBlocks, stats.emptyBlocks*100.0/mAllBlocks.size());
+   #endif
+
+   size_t bytesInUse = mRowsInUse<<IMMIX_LINE_BITS;
+
+   STAMP(t3)
+
+
+   #ifdef HXCPP_TELEMETRY
+   // Detect deallocations - TODO: add STAMP() ?
+   __hxt_gc_after_mark(gByteMarkID, HX_ENDIAN_MARK_ID_BYTE);
+   #endif
+
+   // Sweep large
+
+   // Manage recycle size ?
+   //  clear old frames recycle objects
+   int l2 = largeObjectRecycle.size();
+   for(int i=0;i<largeObjectRecycle.size();i++)
+      HxFree(largeObjectRecycle[i]);
+   largeObjectRecycle.setSize(0);
+
+   size_t recycleRemaining = 0;
+   #ifdef RECYCLE_LARGE
+   if (!inForceCompact)
+      recycleRemaining = mLargeAllocForceRefresh;
+   #endif
+
+   int idx = 0;
+   int l0 = mLargeList.size();
+   while(idx<mLargeList.size())
+   {
+      unsigned int *blob = mLargeList[idx];
+      if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
+      {
+         unsigned int size = *blob;
+         mLargeAllocated -= size;
+         if (size < recycleRemaining)
+         {
+            recycleRemaining -= size;
+            largeObjectRecycle.push(blob);
+         }
+         else
+         {
+            HxFree(blob);
+         }
+
+         mLargeList.qerase(idx);
+      }
+      else
+         idx++;
+   }
+
+   int l1 = mLargeList.size();
+
+
+   STAMP(t4)
+
+   bool defragged = false;
+
+   // Compact/Defrag?
+   #if defined(HXCPP_GC_MOVING) && defined(HXCPP_VISIT_ALLOCS)
+   if (full)
+   {
+      bool doRelease = false;
+
+      if (inForceCompact)
+         doRelease = true;
+      else
+      {
+         size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
+         size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, mem/100 * (size_t)hx::sgTargetFreeSpacePercentage );
+         targetFree = std::min(targetFree, (size_t)sgMaximumFreeSpace );
+         sWorkingMemorySize = std::max( mem + targetFree, (size_t)hx::sgMinimumWorkingMemory);
+
+         size_t allMem = GetWorkingMemory();
+         // 8 Meg too much?
+         size_t allowExtra = std::max( (size_t)8*1024*1024, sWorkingMemorySize*5/4 );
+
+         if ( allMem > sWorkingMemorySize + allowExtra )
+         {
+            #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
+            int releaseGroups = (int)((allMem - sWorkingMemorySize) / (IMMIX_BLOCK_SIZE<<IMMIX_BLOCK_GROUP_BITS));
+            if (releaseGroups)
+               GCLOG("Try to release %d groups\n", releaseGroups );
+            #endif
+            doRelease = true;
+         }
+      }
+
+
+      bool isFragged = stats.fragScore > mAllBlocks.size()*FRAG_THRESH;
+      if (doRelease || isFragged || hx::gAlwaysMove)
+      {
+         if (isFragged && sgTimeToNextTableUpdate>3)
+            sgTimeToNextTableUpdate = 3;
+         calcMoveOrder( );
+
+         // Borrow some blocks to ensuure space to defrag into
+         int workingBlocks = mAllBlocks.size()*3/2 - stats.emptyBlocks;
+         int borrowed = 0;
+         while( mAllBlocks.size()<workingBlocks )
+         {
+            bool dummy = false;
+            if (!AllocMoreBlocks(dummy, true))
+               break;
+            doRelease = true;
+            borrowed++;
+         }
+         stats.emptyBlocks += borrowed;
+         #if defined(SHOW_FRAGMENTATION)
+            GCLOG("Borrowed %d groups for %d target blocks\n", borrowed, workingBlocks);
+         #endif
+
+         MoveBlockJob job(mAllBlocks);
+
+         if (MoveBlocks(job,stats) || doRelease)
+         {
+            if (doRelease)
+            {
+               size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
+               size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, bytesInUse/100 *hx::sgTargetFreeSpacePercentage );
+               targetFree = std::min(targetFree, (size_t)sgMaximumFreeSpace );
+               size_t targetMem = std::max( mem + targetFree, (size_t)hx::sgMinimumWorkingMemory) +
+                                     (2<<(IMMIX_BLOCK_GROUP_BITS+IMMIX_BLOCK_BITS));
+
+               if (inForceCompact)
+                  targetMem = 0;
+               size_t have = GetWorkingMemory();
+               if (targetMem<have)
+               {
+                  size_t releaseSize = have - targetMem;
+                  #ifdef SHOW_FRAGMENTATION
+                  GCLOG(" Release %s bytes to leave %s\n", formatBytes(releaseSize).c_str(), formatBytes(targetMem).c_str() );
+                  #endif
+
+                  int releasedBlocks = releaseEmptyGroups(stats, releaseSize);
+                  #ifdef SHOW_FRAGMENTATION
+                  int releasedGroups = releasedBlocks >> IMMIX_BLOCK_GROUP_BITS;
+                  GCLOG(" Released %s, %d groups\n", formatBytes((size_t)releasedBlocks<<IMMIX_BLOCK_BITS).c_str(), releasedGroups );
+                  #endif
+               }
+            }
+
+            // Reduce sWorkingMemorySize now we have defragged
+            #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
+            GCLOG("After compacting---\n");
+            GCLOG("  total memory : %s\n", formatBytes(GetWorkingMemory()).c_str() );
+            GCLOG("  total needed : %s\n", formatBytes((size_t)mRowsInUse*IMMIX_LINE_LEN).c_str() );
+            GCLOG("  for bytes    : %s\n", formatBytes(bytesInUse).c_str() );
+            GCLOG("  empty blocks : %d (%.1f%%)\n", stats.emptyBlocks, stats.emptyBlocks*100.0/mAllBlocks.size());
+            GCLOG("  fragged blocks : %d (%.1f%%)\n", stats.fraggedBlocks, stats.fraggedBlocks*100.0/mAllBlocks.size() );
+            #endif
+         }
+
+         std::stable_sort(&mAllBlocks[0], &mAllBlocks[0] + mAllBlocks.size(), SortByBlockPtr );
+
+         #ifdef HXCPP_GC_VERIFY
+         VerifyBlockOrder();
+         #endif
+      }
+   }
+   #endif
+
+
+   STAMP(t5)
+
+   size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
+   size_t baseMem = full ? bytesInUse : mem;
+   #ifdef HXCPP_GC_DYNAMIC_SIZE
+   size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, (size_t)(baseMem * profileCollectSummary.spaceFactor ) );
+   #else
+   size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, baseMem/100 *hx::sgTargetFreeSpacePercentage );
+   #endif
+   targetFree = std::min(targetFree, (size_t)sgMaximumFreeSpace );
+   // Only adjust if non-generational
+   if (!generational)
+      sWorkingMemorySize = std::max( mem + targetFree, (size_t)hx::sgMinimumWorkingMemory);
+
+   #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
+   GCLOG("Target memory %s, using %s\n",  formatBytes(sWorkingMemorySize).c_str(), formatBytes(mem).c_str() );
+   #endif
+
+   // Large alloc target
+   int blockSize =  mAllBlocks.size()<<IMMIX_BLOCK_BITS;
+   if (blockSize > mLargeAllocSpace)
+      mLargeAllocSpace = blockSize;
+   mLargeAllocForceRefresh = mLargeAllocated + mLargeAllocSpace;
+
+   mTotalAfterLastCollect = MemUsage();
+
+   #ifdef HXCPP_GC_GENERATIONAL
+   if (generational)
+   {
+      // TODO - include large too?
+      int retained = mRowsInUse - oldRowsInUse;
+      int space = mAllBlocks.size()*IMMIX_USEFUL_LINES - oldRowsInUse;
+      if (space<retained)
+         space = retained;
+
+      mGenerationalRetainEstimate = (double)retained/(double)space;
+   }
+   else
+   {
+      // move towards 0.2
+      mGenerationalRetainEstimate += (0.2-mGenerationalRetainEstimate)*0.25;
+   }
+
+   double filled_ratio = (double)mRowsInUse/(double)(mAllBlocksCount*IMMIX_USEFUL_LINES);
+   double after_gen = filled_ratio + (1.0-filled_ratio)*mGenerationalRetainEstimate;
+
+   if (after_gen<0.75)
+   {
+      sGcMode = gcmGenerational;
+   }
+   else
+   {
+      sGcMode = gcmFull;
+      // What was I thinking here?  This breaks #851
+      //gByteMarkID |= 0x30;
+      
+      // If switching to Full GC, ensure we free old referrers to prevent leaks
+      for(int i=0;i<mLocalAllocs.size();i++)
+      {
+         hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
+         if (ctx->mOldReferrers)
+         {
+            hx::sGlobalChunks.free(ctx->mOldReferrers);
+            ctx->mOldReferrers = 0;
+         }
+      }
+   }
+
+   #ifdef SHOW_MEM_EVENTS
+   GCLOG("filled=%.2f%% + estimate = %.2f%% = %.2f%% -> %s\n",
+         filled_ratio*100, mGenerationalRetainEstimate*100, after_gen*100, sGcMode==gcmFull?"Full":"Generational");
+   #endif
+
+   #endif
+
+   createFreeList();
+
+   // This saves some running/stall time, but increases the total CPU usage
+   // Delaying it until just before the block is used to improve the cache locality
+   backgroundProcessFreeList(true);
+
+   mAllBlocksCount   = mAllBlocks.size();
+   mCurrentRowsInUse = mRowsInUse;
+
+   #ifdef SHOW_MEM_EVENTS
+   GCLOG("Collect Done\n");
+   #endif
+
+   #ifdef PROFILE_COLLECT
+   STAMP(t6)
+   double period = t6-sLastCollect;
+   sLastCollect=t6;
+   GCLOG("Collect time %s total=%.2fms =%.1f%%\n  setup=%.2f\n  %s=%.2f(init=%.2f/roots=%.2f %d+%d/loc=%.2f*%d %d+%d/mark=%.2f %d+%d/fin=%.2f*%d/ids=%.2f)\n  reclaim=%.2f\n  large(%d->%d, recyc %d)=%.2f\n  defrag=%.2f\n",
+            generational ? "gen" : "std",
+           (t6-t0)*1000, (t6-t0)*100.0/period, // total %
+           (t1-t0)*1000, // sync/setup
+           generational ? "mark gen" : "mark", (t2-t1)*1000,
+                   (tMarkInit-t1)*1000,
+                   (tMarkLocal-tMarkInit)*1000,  hx::rootObjects, hx::rootAllocs,
+                   (tMarkLocalEnd-tMarkLocal)*1000, hx::localCount, hx::localObjects-hx::rootObjects, hx::localAllocs-hx::rootAllocs,
+                   (tMarked-tMarkLocalEnd)*1000, sObjectMarks-hx::localObjects, sAllocMarks-hx::localAllocs,
+                   (hx::tFinalizers-tMarked)*1000, hx::finalizerCount,
+                   (t2-hx::tFinalizers)*1000,
+           (t3-t2)*1000, // reclaim
+           l0, l1, l2, (t4-t3)*1000, // large
+           (t5-t4)*1000 // defrag
+           );
+   sObjectMarks = sAllocMarks = 0;
+
+   #endif
+
+   #ifdef PROFILE_THREAD_USAGE
+   GCLOG("Thread chunks:%d, wakes=%d\n", sThreadChunkPushCount, sThreadChunkWakes);
+   for(int i=-1;i<MAX_GC_THREADS;i++)
+     GCLOG(" thread %d] %d + %d\n", i, sThreadMarkCount[i], sThreadArrayMarkCount[i]);
+   GCLOG("Locking spins  : %d\n", sSpinCount);
+   sSpinCount = 0;
+   #endif
+
+   #ifdef HXCPP_GC_GENERATIONAL
+   if (sGcMode==gcmGenerational)
+   {
+      bool ok = true;
+      for(int i=0;i<mLocalAllocs.size();i++)
+      {
+         hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
+         // Check if already allocated to prevent leaks or double-allocation
+         if (ctx->mOldReferrers) continue;
+
+         ctx->mOldReferrers = hx::sGlobalChunks.alloc();
+         if (!ctx->mOldReferrers)
+            ok = false;
+      }
+      if (!ok)
+      {
+         // Allocation failed - abort generational GC setup
+         // Instead of falling back to Full GC immediately, we just clean up and skip.
+         // This assumes the next allocation will trigger another GC check, or we live with it until next time.
+         if (sEnableGCLog)
+         {
+            GCLOG("Generational GC setup failed (OOM for referrers). Skipping GC cycle.\n");
+         }
+
+         // Clean up any successfully allocated buffers
+         for(int i=0;i<mLocalAllocs.size();i++)
+         {
+            hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
+            if (ctx->mOldReferrers)
+            {
+               hx::sGlobalChunks.free(ctx->mOldReferrers);
+               ctx->mOldReferrers = 0;
+            }
+         }
+         
+         // Force Full GC mode for *next* time (or disable generational temporarily)
+         // But per request, we do NOT trigger a Full GC right now.
+         //sGcMode = gcmFull;
+      }
+   }
+   #endif
+
+
+   #ifdef HXCPP_GC_VERIFY
+   VerifyBlockOrder();
+   #endif
+
+   for(int i=0;i<LOCAL_POOL_SIZE;i++)
+   {
+      LocalAllocator *l = mLocalPool[i];
+      if (l)
+         ClearPooledAlloc(l);
+   }
+
+   #ifdef HXCPP_TELEMETRY
+   __hxt_gc_end();
+   #endif
+
+   sgIsCollecting = false;
+   if (this_local)
+      this_local->mIsCollecting = false;
+   hx::gPauseForCollect = 0;
+   #ifndef HXCPP_SINGLE_THREADED_APP
+      for(int i=0;i<mLocalAllocs.size();i++)
+      {
+         #ifdef HXCPP_SCRIPTABLE
+         ((hx::StackContext *)mLocalAllocs[i])->byteMarkId = hx::gByteMarkID;
+         #endif
+         if (mLocalAllocs[i]!=this_local)
+            ReleaseFromSafe(mLocalAllocs[i]);
+      }
+
+      if (!inLocked)
+         gThreadStateChangeLock->Unlock();
+   #else
+     #ifdef HXCPP_SCRIPTABLE
+     hx::gMainThreadContext->byteMarkId = hx::gByteMarkID;
+     #endif
+   #endif
+
+
+   PROFILE_COLLECT_SUMMARY_END;
+}
 
 inline LocalAllocator *GetLocalAlloc(bool inAllowEmpty=false)
 {
@@ -7034,15 +7413,10 @@ void InitAlloc() //inits
       int mp = ReadEnvInt("HX_GC_MAX_PAUSE_MS", 1);
       int pr = ReadEnvBool("HX_GC_PARALLEL_REF_PROC", 1);
       int fs = ReadEnvBool("HX_GC_FORCE_SUSPEND", 0);
-      int bd = ReadEnvInt("HX_GC_MINOR_BASE_DELTA_BYTES", 5 * 1024 * 1024);
-      int gm = ReadEnvInt("HX_GC_MINOR_GATE_MS", 333);
+      int bd = ReadEnvInt("HX_GC_MINOR_BASE_DELTA_BYTES", 10 * 1024 * 1024);
+      int gm = ReadEnvInt("HX_GC_MINOR_GATE_MS", 500);
       int sb = ReadEnvInt("HX_GC_MINOR_START_BYTES", 8*1024*1024);
       int lr = ReadEnvBool("HX_GC_LARGE_REFRESH", 0);
-      int cw = ReadEnvInt("HX_GC_CONTAINER_WEIGHT", 5);
-      int dw = ReadEnvInt("HX_GC_DATA_WEIGHT", 1);
-      int co = ReadEnvInt("HX_GC_CHURN_SKIP_OVERRIDE", 1);
-      int cr = ReadEnvInt("HX_GC_CHURN_CONTAINER_RATIO_PERMILLE", 600);
-      int st = ReadEnvInt("HX_GC_CHURN_SURVIVAL_THRESHOLD_PERMILLE", 350);
       hx::GCConfig cfg = hx::GetGCConfig();
       cfg.parallelGcThreads = pg;
       cfg.concRefinementThreads = rt;
@@ -7055,11 +7429,6 @@ void InitAlloc() //inits
       sMinorMinIntervalMs = gm>0 ? gm : 0;
       sMinorInitTime = __hxcpp_time_stamp();
       sMinorStartBytes = sb>0 ? (size_t)sb : 0;
-      sGarbageWeightContainer = cw>0 ? cw : 1;
-      sGarbageWeightData = dw>0 ? dw : 1;
-      sChurnSkipOverrideEnabled = co>0 ? 1 : 0;
-      sChurnContainerRatioPermille = cr>0 ? cr : 600;
-      sChurnSurvivalThresholdPermille = st>0 ? st : 350;
    }
    
    sGlobalAlloc = new GlobalAllocator();
@@ -7619,20 +7988,15 @@ size_t __hxcpp_gc_working_memory()
 
 size_t GlobalAllocator::MemGarbageEstimate()
    {
-      size_t newContainerAlloc = 0;
-      size_t newDataAlloc = 0;
+      size_t newAllocations = mAllocatedSinceLastGC;
+      
+      // Add up allocations from all threads
       for(int i=0; i<mLocalAllocs.size(); i++)
          if (mLocalAllocs[i])
-         {
-            newContainerAlloc += mLocalAllocs[i]->mContainerBytesAllocatedSinceGC;
-            newDataAlloc += mLocalAllocs[i]->mDataBytesAllocatedSinceGC;
-         }
-      size_t fallback = mAllocatedSinceLastGC;
-      if (fallback>0 && newContainerAlloc==0 && newDataAlloc==0)
-         newDataAlloc += fallback;
-      double weighted = (double)newContainerAlloc * (double)sGarbageWeightContainer +
-                        (double)newDataAlloc * (double)sGarbageWeightData;
-      return (size_t)(weighted * (1.0 - mSurvivalRate));
+            newAllocations += mLocalAllocs[i]->mBytesAllocatedSinceGC;
+
+      // Estimated garbage = New Allocations * (1.0 - Survival Rate)
+      return (size_t)(newAllocations * (1.0 - mSurvivalRate));
    }
 
 void GlobalAllocator::UpdateSurvivalRate(size_t oldRowsInUse)
@@ -7644,8 +8008,6 @@ void GlobalAllocator::UpdateSurvivalRate(size_t oldRowsInUse)
          {
              totalAllocated += mLocalAllocs[i]->mBytesAllocatedSinceGC;
              mLocalAllocs[i]->mBytesAllocatedSinceGC = 0;
-             mLocalAllocs[i]->mContainerBytesAllocatedSinceGC = 0;
-             mLocalAllocs[i]->mDataBytesAllocatedSinceGC = 0;
          }
       }
       // If using Block-based fallback
@@ -7670,41 +8032,6 @@ void GlobalAllocator::UpdateSurvivalRate(size_t oldRowsInUse)
 size_t __hxcpp_gc_get_reserved_bytes()
 {
    return sGlobalAlloc ? sGlobalAlloc->MemReserved() : 0;
-}
-
-double __hxcpp_gc_survival_rate()
-{
-   return sGlobalAlloc ? sGlobalAlloc->mSurvivalRate : 1.0;
-}
-
-size_t __hxcpp_gc_container_alloc_since_gc()
-{
-   size_t sum = 0;
-   if (sGlobalAlloc)
-   {
-      for(int i=0;i<sGlobalAlloc->mLocalAllocs.size();i++)
-      {
-         LocalAllocator *la = sGlobalAlloc->mLocalAllocs[i];
-         if (la)
-            sum += la->mContainerBytesAllocatedSinceGC;
-      }
-   }
-   return sum;
-}
-
-size_t __hxcpp_gc_data_alloc_since_gc()
-{
-   size_t sum = 0;
-   if (sGlobalAlloc)
-   {
-      for(int i=0;i<sGlobalAlloc->mLocalAllocs.size();i++)
-      {
-         LocalAllocator *la = sGlobalAlloc->mLocalAllocs[i];
-         if (la)
-            sum += la->mDataBytesAllocatedSinceGC;
-      }
-   }
-   return sum;
 }
 
    int   __hxcpp_gc_used_bytes()
@@ -7764,12 +8091,6 @@ void hxcpp_set_top_of_stack()
 void __hxcpp_gc_update()
 {
    MaybeMinorCollect();
-}
-
-void __hxcpp_gc_set_garbage_weights(int containerWeight, int dataWeight)
-{
-   sGarbageWeightContainer = containerWeight>0 ? containerWeight : 1;
-   sGarbageWeightData = dataWeight>0 ? dataWeight : 1;
 }
 
 void __hxcpp_enter_gc_free_zone()
