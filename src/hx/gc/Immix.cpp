@@ -5446,6 +5446,10 @@ public:
                 // Fast path: valid pointer and not tagged
                 if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
                 {
+                   // VTable check: if vptr is null or low address, it's invalid
+                   void **vptr = (void **)obj;
+                   if (!*vptr || (size_t)(*vptr) < 0x10000) continue;
+
                    #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
                    __try {
                        obj->__Mark(marker);
@@ -5479,6 +5483,10 @@ public:
               // Bypass MarkObjectAlloc check because these are Old objects that we MUST scan
               if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
               {
+                 // VTable check: if vptr is null or low address, it's invalid
+                 void **vptr = (void **)obj;
+                 if (!*vptr || (size_t)(*vptr) < 0x10000) continue;
+
                  #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
                  __try {
                      obj->__Mark(__inCtx);
