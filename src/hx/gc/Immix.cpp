@@ -182,17 +182,16 @@ static inline void MaybeMinorCollect()
          hx::ExitGCFreeZone();
 
          now = __hxcpp_time_stamp();
-         if (!sgIsCollecting && !hx::gPauseForCollect &&
-             now - sMinorLastCollect >= (double)sMinorMinIntervalMs/1000.0)
+         if (!sgIsCollecting && !hx::gPauseForCollect)
          {
             size_t reserved = __hxcpp_gc_get_reserved_bytes();
             bool skip = false;
             if (reserved > sLastReservedBytes)
             {
                 size_t growth = reserved - sLastReservedBytes;
-                // Only skip if growth is significant (> 1MB)
-                // This prevents small allocations from blocking GC, while allowing heavy loading to proceed smoothly.
-                if (growth > 1.2 * 1024 * 1024)
+                // Only skip if growth is significant (> 4MB)
+               // This prevents small allocations from blocking GC, while allowing heavy loading to proceed smoothly.
+               if (growth > 4.0 * 1024 * 1024)
                 {
                    if (sEnableGCLog)
                    {
@@ -247,11 +246,12 @@ static inline void MaybeMinorCollect()
 
       if (doCollect)
       {
+         // sStrictMinorRequested = 1;
+         // int oldAgg = sForceSuspendSafepoint;
+         // sForceSuspendSafepoint = 1;
          sStrictMinorRequested = 1;
-         int oldAgg = sForceSuspendSafepoint;
-         sForceSuspendSafepoint = 1;
          __hxcpp_collect(false);
-         sForceSuspendSafepoint = oldAgg;
+         // sForceSuspendSafepoint = oldAgg;
       }
    }
 }
@@ -5226,8 +5226,19 @@ public:
    size_t MemGarbageEstimate();
 
 
+
+
+   // Use a Bloom filter-like or simple hash cache to speed up repeated checks if needed
+   // But for now, optimize IsValidPointer to be fast for common cases
    bool IsAllBlock(BlockData *block)
    {
+      #if defined(HX_WINDOWS)
+         static __declspec(thread) BlockData *tLastBlock = 0;
+      #else
+         static __thread BlockData *tLastBlock = 0;
+      #endif
+      if (block==tLastBlock) return true;
+
       if (mAllBlocks.size())
       {
          // Fast path optimization: check common boundaries first
@@ -5235,7 +5246,7 @@ public:
          BlockData *max = mAllBlocks[mAllBlocks.size()-1]->mPtr;
          
          if (block < min || block > max) return false;
-         if (block == min || block == max) return true;
+         if (block == min || block == max) { tLastBlock=block; return true; }
          
          int minIdx = 0;
          int maxIdx = mAllBlocks.size()-1;
@@ -5245,7 +5256,7 @@ public:
             int mid = (maxIdx + minIdx) >> 1;
             BlockData *midPtr = mAllBlocks[mid]->mPtr;
             
-            if (midPtr == block) return true;
+            if (midPtr == block) { tLastBlock=block; return true; }
             
             if (midPtr < block)
                minIdx = mid;
@@ -5256,8 +5267,6 @@ public:
       return false;
    }
 
-   // Use a Bloom filter-like or simple hash cache to speed up repeated checks if needed
-   // But for now, optimize IsValidPointer to be fast for common cases
    bool IsValidPointer(void *inPtr)
    {
       if (!inPtr) return false;
@@ -5268,22 +5277,17 @@ public:
       BlockData *block = (BlockData *)( ((size_t)inPtr) & IMMIX_BLOCK_BASE_MASK);
       if (IsAllBlock(block))
       {
-         // Basic bounds check within the block to be safe before reading header
-         size_t offset = ((size_t)inPtr) & IMMIX_BLOCK_OFFSET_MASK;
-         if (offset < sizeof(int)) return false; // Too close to start of block for a header
-         
-         int line = offset >> IMMIX_LINE_BITS;
-         
-         if (block->mRowMarked[line] == 0)
-            return false;
-
-         // -----------------------------------------------------------
-
-         unsigned int *header = (unsigned int *)((char *)inPtr - sizeof(int));
-         unsigned int flags = *header;
-         if ((flags & 0xffff) == 0) return false;
-         
-         return true;
+          // Basic bounds check within the block to be safe before reading header
+          size_t offset = ((size_t)inPtr) & IMMIX_BLOCK_OFFSET_MASK;
+          if (offset < sizeof(int)) return false; // Too close to start of block for a header
+          // Note: IMMIX_BLOCK_SIZE is usually large enough that we don't need upper bound check if mask is correct.
+          
+          unsigned int *header = (unsigned int *)((char *)inPtr - sizeof(int));
+          
+          unsigned int flags = *header;
+          if ((flags & 0xffff) == 0) return false;
+          
+          return true;
       }
 
       // Check large objects
@@ -5361,14 +5365,25 @@ public:
    {
       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
       __try {
-          if (obj && IsValidPointer(obj)) hx::MarkObjectAlloc(obj, ctx);
+          if (obj && IsValidPointer(obj)) 
+          {
+             // VTable check for safety
+             void **vptr = (void **)obj;
+             if (*vptr && (size_t)(*vptr) >= 0x10000)
+                hx::MarkObjectAlloc(obj, ctx);
+          }
       }
       __except(1) {
           GCLOG("Warning: SEH Exception during MarkObjectAlloc on %p\n", obj);
       }
       #else
       if (obj && IsValidPointer(obj)) 
-          hx::MarkObjectAlloc(obj, ctx);
+      {
+          // VTable check for safety
+          void **vptr = (void **)obj;
+          if (*vptr && (size_t)(*vptr) >= 0x10000)
+             hx::MarkObjectAlloc(obj, ctx);
+      }
       #endif
    }
 
@@ -5451,17 +5466,11 @@ public:
              {
                 hx::Object *obj = ref[r];
                 // Fast path: valid pointer and not tagged
-                if (obj && !((size_t)obj & 3))
+                if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
                 {
                    // VTable check: if vptr is null or low address, it's invalid
-                   void **vptr = (void **)obj;                 
-                   
-                   void *vtable = *vptr;
-                   if (!vtable || (size_t)vtable < 0x10000 || ((size_t)vtable & (sizeof(void*)-1))) continue;
-                   
-                   // Extra check: Is the vtable pointer inside the GC heap?
-                   // If so, it's garbage (vtables are static).
-                   if (GetMemType(vtable) != memUnmanaged) continue;
+                   void **vptr = (void **)obj;
+                   if (!*vptr || (size_t)(*vptr) < 0x10000) continue;
 
                    #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
                    __try {
@@ -5493,21 +5502,18 @@ public:
            {
               hx::Object *obj = (*inSet)[i];
               // Bypass MarkObjectAlloc check because these are Old objects that we MUST scan
-              if (obj && !((size_t)obj & 3))
+              if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
               {
                  // VTable check: if vptr is null or low address, it's invalid
                  void **vptr = (void **)obj;
-                 // ALIGNMENT CHECK: VTable pointers must be aligned.
-                 // HEAP CHECK: VTable should NOT be in GC heap.
-                 void *vtable = *vptr;
-                 if (!vtable || (size_t)vtable < 0x10000 || ((size_t)vtable & (sizeof(void*)-1))) continue;
-                 if (GetMemType(vtable) != memUnmanaged) continue;
+                 if (!*vptr || (size_t)(*vptr) < 0x10000) continue;
 
                  #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
                  __try {
                      obj->__Mark(__inCtx);
                  }
                  __except(1) {
+                     // GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
                  }
                  #else
                  obj->__Mark(__inCtx);
@@ -5530,32 +5536,14 @@ public:
       {
          hx::Object *&obj = **i;
          // Ensure root pointer is valid before marking
-         if (obj && !((size_t)obj & 3))
+         if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+             SafeMarkObjectAlloc(obj , __inCtx );
+         else if (obj)
          {
-             if (IsValidPointer(obj))
-             {
-                 SafeMarkObjectAlloc(obj , __inCtx );
-             }
-             else
-             {
-                 // Not in heap - maybe static?
-                 // Check vtable
-                 void **vptr = (void **)obj;
-                 void *vtable = *vptr;
-                 if (vtable && (size_t)vtable > 0x10000 && !((size_t)vtable & (sizeof(void*)-1)))
-                 {
-                      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-                      __try {
-                          obj->__Mark(__inCtx);
-                      }
-                      __except(1) {
-                          GCLOG("Warning: SEH Exception marking non-heap root %p\n", obj);
-                      }
-                      #else
-                      obj->__Mark(__inCtx);
-                      #endif
-                 }
-             }
+             // If we have an invalid root pointer, we should probably null it out to prevent future crashes
+             // or at least not try to mark it.
+             // But modifying roots might be dangerous if logic depends on them.
+             // Safest is to just skip marking it.
          }
       }
 
@@ -5566,27 +5554,8 @@ public:
             int offset = i->second;
             hx::Object *obj = (hx::Object *)(ptr - offset);
 
-            if (obj && !((size_t)obj & 3))
-            {
-               if (IsValidPointer(obj))
-                   SafeMarkObjectAlloc(obj , __inCtx );
-               else
-               {
-                   void **vptr = (void **)obj;
-                   void *vtable = *vptr;
-                   if (vtable && (size_t)vtable > 0x10000 && !((size_t)vtable & (sizeof(void*)-1)))
-                   {
-                        #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-                        __try {
-                            obj->__Mark(__inCtx);
-                        }
-                        __except(1) { }
-                        #else
-                        obj->__Mark(__inCtx);
-                        #endif
-                   }
-               }
-            }
+            if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+                SafeMarkObjectAlloc(obj , __inCtx );
          }
    }
 
@@ -5662,15 +5631,23 @@ inline void hx::MarkContext::processMarkStack()
          {
             #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
             __try {
-                // if (sGlobalAlloc->IsValidPointer(obj))
-                    obj->__Mark(this);
+                if (sGlobalAlloc->IsValidPointer(obj))
+                {
+                   void **vptr = (void **)obj;
+                   if (*vptr && (size_t)(*vptr) >= 0x10000)
+                      obj->__Mark(this);
+                }
             }
             __except(1) {
                  GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
             }
             #else
-            // if (sGlobalAlloc->IsValidPointer(obj))
-                obj->__Mark(this);
+            if (sGlobalAlloc->IsValidPointer(obj))
+            {
+                void **vptr = (void **)obj;
+                if (*vptr && (size_t)(*vptr) >= 0x10000)
+                   obj->__Mark(this);
+            }
             #endif
 
             #if HX_MULTI_THREAD_MARKING
@@ -7547,7 +7524,7 @@ void InitAlloc() //inits
       int mp = ReadEnvInt("HX_GC_MAX_PAUSE_MS", 1);
       int pr = ReadEnvBool("HX_GC_PARALLEL_REF_PROC", 1);
       int fs = ReadEnvBool("HX_GC_FORCE_SUSPEND", 0);
-      int bd = ReadEnvInt("HX_GC_MINOR_BASE_DELTA_BYTES", 10 * 1024 * 1024);
+      int bd = ReadEnvInt("HX_GC_MINOR_BASE_DELTA_BYTES", 5 * 1024 * 1024);
       int gm = ReadEnvInt("HX_GC_MINOR_GATE_MS", 500);
       int sb = ReadEnvInt("HX_GC_MINOR_START_BYTES", 8*1024*1024);
       int lr = ReadEnvBool("HX_GC_LARGE_REFRESH", 0);
@@ -8129,7 +8106,7 @@ size_t GlobalAllocator::MemGarbageEstimate()
          if (mLocalAllocs[i])
             newAllocations += mLocalAllocs[i]->mBytesAllocatedSinceGC;
 
-      return newAllocations;
+      return (size_t)(newAllocations * (1.0 - mSurvivalRate));
    }
 
 void GlobalAllocator::UpdateSurvivalRate(size_t oldRowsInUse)
