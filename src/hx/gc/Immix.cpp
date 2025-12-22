@@ -5274,7 +5274,7 @@ public:
          
          int line = offset >> IMMIX_LINE_BITS;
          
-         if (block->mRow[line] == IMMIX_ROW_EMPTY)
+         if (block->mRowMarked[line] == 0)
             return false;
 
          // -----------------------------------------------------------
@@ -5451,11 +5451,17 @@ public:
              {
                 hx::Object *obj = ref[r];
                 // Fast path: valid pointer and not tagged
-                if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+                if (obj && !((size_t)obj & 3))
                 {
                    // VTable check: if vptr is null or low address, it's invalid
-                   void **vptr = (void **)obj;
-                   if (!*vptr || (size_t)(*vptr) < 0x10000) continue;
+                   void **vptr = (void **)obj;                 
+                   
+                   void *vtable = *vptr;
+                   if (!vtable || (size_t)vtable < 0x10000 || ((size_t)vtable & (sizeof(void*)-1))) continue;
+                   
+                   // Extra check: Is the vtable pointer inside the GC heap?
+                   // If so, it's garbage (vtables are static).
+                   if (GetMemType(vtable) != memUnmanaged) continue;
 
                    #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
                    __try {
@@ -5487,18 +5493,21 @@ public:
            {
               hx::Object *obj = (*inSet)[i];
               // Bypass MarkObjectAlloc check because these are Old objects that we MUST scan
-              if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+              if (obj && !((size_t)obj & 3))
               {
                  // VTable check: if vptr is null or low address, it's invalid
                  void **vptr = (void **)obj;
-                 if (!*vptr || (size_t)(*vptr) < 0x10000) continue;
+                 // ALIGNMENT CHECK: VTable pointers must be aligned.
+                 // HEAP CHECK: VTable should NOT be in GC heap.
+                 void *vtable = *vptr;
+                 if (!vtable || (size_t)vtable < 0x10000 || ((size_t)vtable & (sizeof(void*)-1))) continue;
+                 if (GetMemType(vtable) != memUnmanaged) continue;
 
                  #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
                  __try {
                      obj->__Mark(__inCtx);
                  }
                  __except(1) {
-                     // GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
                  }
                  #else
                  obj->__Mark(__inCtx);
@@ -5521,14 +5530,32 @@ public:
       {
          hx::Object *&obj = **i;
          // Ensure root pointer is valid before marking
-         if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
-             SafeMarkObjectAlloc(obj , __inCtx );
-         else if (obj)
+         if (obj && !((size_t)obj & 3))
          {
-             // If we have an invalid root pointer, we should probably null it out to prevent future crashes
-             // or at least not try to mark it.
-             // But modifying roots might be dangerous if logic depends on them.
-             // Safest is to just skip marking it.
+             if (IsValidPointer(obj))
+             {
+                 SafeMarkObjectAlloc(obj , __inCtx );
+             }
+             else
+             {
+                 // Not in heap - maybe static?
+                 // Check vtable
+                 void **vptr = (void **)obj;
+                 void *vtable = *vptr;
+                 if (vtable && (size_t)vtable > 0x10000 && !((size_t)vtable & (sizeof(void*)-1)))
+                 {
+                      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+                      __try {
+                          obj->__Mark(__inCtx);
+                      }
+                      __except(1) {
+                          GCLOG("Warning: SEH Exception marking non-heap root %p\n", obj);
+                      }
+                      #else
+                      obj->__Mark(__inCtx);
+                      #endif
+                 }
+             }
          }
       }
 
@@ -5539,8 +5566,27 @@ public:
             int offset = i->second;
             hx::Object *obj = (hx::Object *)(ptr - offset);
 
-            if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
-                SafeMarkObjectAlloc(obj , __inCtx );
+            if (obj && !((size_t)obj & 3))
+            {
+               if (IsValidPointer(obj))
+                   SafeMarkObjectAlloc(obj , __inCtx );
+               else
+               {
+                   void **vptr = (void **)obj;
+                   void *vtable = *vptr;
+                   if (vtable && (size_t)vtable > 0x10000 && !((size_t)vtable & (sizeof(void*)-1)))
+                   {
+                        #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+                        __try {
+                            obj->__Mark(__inCtx);
+                        }
+                        __except(1) { }
+                        #else
+                        obj->__Mark(__inCtx);
+                        #endif
+                   }
+               }
+            }
          }
    }
 
@@ -5616,14 +5662,14 @@ inline void hx::MarkContext::processMarkStack()
          {
             #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
             __try {
-                if (sGlobalAlloc->IsValidPointer(obj))
+                // if (sGlobalAlloc->IsValidPointer(obj))
                     obj->__Mark(this);
             }
             __except(1) {
                  GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
             }
             #else
-            if (sGlobalAlloc->IsValidPointer(obj))
+            // if (sGlobalAlloc->IsValidPointer(obj))
                 obj->__Mark(this);
             #endif
 
