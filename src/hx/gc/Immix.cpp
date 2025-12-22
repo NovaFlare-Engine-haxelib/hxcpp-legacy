@@ -5230,25 +5230,27 @@ public:
    {
       if (mAllBlocks.size())
       {
-         int min = 0;
-         int max = mAllBlocks.size()-1;
-         if (block==mAllBlocks[0]->mPtr)
-            return true;
-         if (block==mAllBlocks[max]->mPtr)
-            return true;
-         if (block>mAllBlocks[0]->mPtr && block<mAllBlocks[max]->mPtr)
+         // Fast path optimization: check common boundaries first
+         BlockData *min = mAllBlocks[0]->mPtr;
+         BlockData *max = mAllBlocks[mAllBlocks.size()-1]->mPtr;
+         
+         if (block < min || block > max) return false;
+         if (block == min || block == max) return true;
+         
+         int minIdx = 0;
+         int maxIdx = mAllBlocks.size()-1;
+         
+         while(minIdx < maxIdx - 1)
          {
-            while(min<max-1)
-            {
-               int mid = (max+min)>>1;
-               if (mAllBlocks[mid]->mPtr==block)
-                  return true;
-
-               if (mAllBlocks[mid]->mPtr<block)
-                  min = mid;
-               else
-                  max = mid;
-            }
+            int mid = (maxIdx + minIdx) >> 1;
+            BlockData *midPtr = mAllBlocks[mid]->mPtr;
+            
+            if (midPtr == block) return true;
+            
+            if (midPtr < block)
+               minIdx = mid;
+            else
+               maxIdx = mid;
          }
       }
       return false;
@@ -5455,7 +5457,6 @@ public:
                        obj->__Mark(marker);
                    }
                    __except(1) {
-                       // GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
                    }
                    #else
                    obj->__Mark(marker);
@@ -7172,6 +7173,8 @@ void GlobalAllocator::Collect(bool inMajor, bool inForceCompact, bool inLocked,b
    mTotalAfterLastCollect = MemUsage();
 
    #ifdef HXCPP_GC_GENERATIONAL
+   bool forceKeepGenerational = (strict != 0);
+
    if (generational)
    {
       // TODO - include large too?
@@ -7191,7 +7194,7 @@ void GlobalAllocator::Collect(bool inMajor, bool inForceCompact, bool inLocked,b
    double filled_ratio = (double)mRowsInUse/(double)(mAllBlocksCount*IMMIX_USEFUL_LINES);
    double after_gen = filled_ratio + (1.0-filled_ratio)*mGenerationalRetainEstimate;
 
-   if (after_gen<0.75)
+   if (forceKeepGenerational || after_gen<0.75)
    {
       sGcMode = gcmGenerational;
    }
@@ -8228,6 +8231,12 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
    // Verify pointer validity before accessing
    if (!((size_t)inObj.mPtr & 3) && sGlobalAlloc->IsValidPointer(inObj.mPtr))
    {
+       // Additional safety: Check if vptr is valid before calling __hxcpp_obj_id
+       // __hxcpp_obj_id might access the object header or vtable.
+       hx::Object *obj = inObj.mPtr;
+       void **vptr = (void **)obj;
+       if (!*vptr || (size_t)(*vptr) < 0x10000) return 0;
+
        return __hxcpp_obj_id(inObj);
    }
    
@@ -8244,6 +8253,7 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
        return 0;
        
    hx::Object *obj = inObj.mPtr;
+   
    #if defined(HXCPP_M64)
    size_t h64 = (size_t)obj;
    return (unsigned int)(h64>>2) ^ (unsigned int)(h64>>32);
