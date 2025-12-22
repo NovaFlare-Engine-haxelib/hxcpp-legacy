@@ -5268,17 +5268,22 @@ public:
       BlockData *block = (BlockData *)( ((size_t)inPtr) & IMMIX_BLOCK_BASE_MASK);
       if (IsAllBlock(block))
       {
-          // Basic bounds check within the block to be safe before reading header
-          size_t offset = ((size_t)inPtr) & IMMIX_BLOCK_OFFSET_MASK;
-          if (offset < sizeof(int)) return false; // Too close to start of block for a header
-          // Note: IMMIX_BLOCK_SIZE is usually large enough that we don't need upper bound check if mask is correct.
-          
-          unsigned int *header = (unsigned int *)((char *)inPtr - sizeof(int));
-          
-          unsigned int flags = *header;
-          if ((flags & 0xffff) == 0) return false;
-          
-          return true;
+         // Basic bounds check within the block to be safe before reading header
+         size_t offset = ((size_t)inPtr) & IMMIX_BLOCK_OFFSET_MASK;
+         if (offset < sizeof(int)) return false; // Too close to start of block for a header
+         
+         int line = offset >> IMMIX_LINE_BITS;
+         
+         if (block->mRow[line] == IMMIX_ROW_EMPTY)
+            return false;
+
+         // -----------------------------------------------------------
+
+         unsigned int *header = (unsigned int *)((char *)inPtr - sizeof(int));
+         unsigned int flags = *header;
+         if ((flags & 0xffff) == 0) return false;
+         
+         return true;
       }
 
       // Check large objects
