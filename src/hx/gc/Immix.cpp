@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #ifndef HX_WINDOWS
 #include <unistd.h>
+#include <fcntl.h>
 #endif
 
 
@@ -3551,7 +3552,7 @@ public:
 
    void *AllocLarge(int inSize, bool inClear)
    {
-      MaybeMinorCollect();
+      //MaybeMinorCollect();
 
       if (hx::gPauseForCollect)
          __hxcpp_gc_safe_point();
@@ -5250,21 +5251,44 @@ public:
       return false;
    }
 
+   // Use a Bloom filter-like or simple hash cache to speed up repeated checks if needed
+   // But for now, optimize IsValidPointer to be fast for common cases
    bool IsValidPointer(void *inPtr)
    {
       if (!inPtr) return false;
       if ((size_t)inPtr & 3) return false;
 
-      // Try large objects first as they are fewer
+      // Fast check: Is it in a valid block range?
+      // Most pointers are small objects in blocks.
+      BlockData *block = (BlockData *)( ((size_t)inPtr) & IMMIX_BLOCK_BASE_MASK);
+      if (IsAllBlock(block)) return true;
+
+      // Check large objects
       for(int i=0;i<mLargeList.size();i++)
       {
          unsigned int *blob = mLargeList[i] + 2;
          if (blob==inPtr) return true;
       }
-
-      BlockData *block = (BlockData *)( ((size_t)inPtr) & IMMIX_BLOCK_BASE_MASK);
-      if (IsAllBlock(block)) return true;
-
+      
+      // Basic address validation
+      #ifdef HX_WINDOWS
+      MEMORY_BASIC_INFORMATION mbi;
+      if (VirtualQuery(inPtr, &mbi, sizeof(mbi)) == 0) return false;
+      if (mbi.State != MEM_COMMIT) return false;
+      if (mbi.Protect & PAGE_GUARD) return false;
+      if (mbi.Protect & PAGE_NOACCESS) return false;
+      #else
+      // For Linux/Mac/Android, use pipe trick to check if address is readable
+      int nullfd = open("/dev/random", O_WRONLY);
+      if (nullfd >= 0) {
+          if (write(nullfd, inPtr, 1) < 0) {
+              close(nullfd);
+              return false;
+          }
+          close(nullfd);
+      }
+      #endif
+      
       return false;
    }
 
@@ -5422,8 +5446,8 @@ public:
              for(int r=0;r<n;r++)
              {
                 hx::Object *obj = ref[r];
-                if (obj && !((size_t)obj & 3))
-                   SafeMarkObjectAlloc(obj, marker);
+                if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+                   obj->__Mark(marker);
              }
           }
       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
@@ -5444,7 +5468,7 @@ public:
            {
               hx::Object *obj = (*inSet)[i];
               // Bypass MarkObjectAlloc check because these are Old objects that we MUST scan
-              if (obj && !((size_t)obj & 3))
+              if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
                  obj->__Mark(__inCtx);
            }
        #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
@@ -6764,6 +6788,18 @@ void GlobalAllocator::Collect(bool inMajor, bool inForceCompact, bool inLocked,b
          ctx->mOldReferrers = 0;
       }
    }
+   else
+   {
+      for(int i=0;i<mLocalAllocs.size();i++)
+      {
+         hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
+         if (ctx->mOldReferrers)
+         {
+            hx::sGlobalChunks.free( ctx->mOldReferrers );
+            ctx->mOldReferrers = 0;
+         }
+      }
+   }
 
    hx::QuickVec<hx::Object *> rememberedSet;
    rememberedSetPtr = &rememberedSet;
@@ -6775,7 +6811,10 @@ void GlobalAllocator::Collect(bool inMajor, bool inForceCompact, bool inLocked,b
       GCLOG("Patch remembered set marks %d\n", rememberedSet.size());
       #endif
       for(int i=0;i<rememberedSet.size();i++)
-         ((unsigned char *)rememberedSet[i])[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+      {
+         if (IsValidPointer(rememberedSet[i]))
+             ((unsigned char *)rememberedSet[i])[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+      }
    }
    #endif
 
