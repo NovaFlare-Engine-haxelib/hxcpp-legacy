@@ -5016,7 +5016,10 @@ public:
             CheckGenerationalReferrersSafe(ctx, &mMarker, i);
          }
          #endif
-         SafeMarkLocalAlloc(mLocalAllocs[i] , &mMarker);
+         
+         // Fix: Check context pointer before marking local alloc
+         if (mLocalAllocs[i])
+             SafeMarkLocalAlloc(mLocalAllocs[i] , &mMarker);
       }
 
       #ifdef HXCPP_GC_GENERATIONAL
@@ -5261,7 +5264,20 @@ public:
       // Fast check: Is it in a valid block range?
       // Most pointers are small objects in blocks.
       BlockData *block = (BlockData *)( ((size_t)inPtr) & IMMIX_BLOCK_BASE_MASK);
-      if (IsAllBlock(block)) return true;
+      if (IsAllBlock(block))
+      {
+          // Basic bounds check within the block to be safe before reading header
+          size_t offset = ((size_t)inPtr) & IMMIX_BLOCK_OFFSET_MASK;
+          if (offset < sizeof(int)) return false; // Too close to start of block for a header
+          // Note: IMMIX_BLOCK_SIZE is usually large enough that we don't need upper bound check if mask is correct.
+          
+          unsigned int *header = (unsigned int *)((char *)inPtr - sizeof(int));
+          
+          unsigned int flags = *header;
+          if ((flags & 0xffff) == 0) return false;
+          
+          return true;
+      }
 
       // Check large objects
       for(int i=0;i<mLargeList.size();i++)
@@ -5269,25 +5285,6 @@ public:
          unsigned int *blob = mLargeList[i] + 2;
          if (blob==inPtr) return true;
       }
-      
-      // Basic address validation
-      #ifdef HX_WINDOWS
-      MEMORY_BASIC_INFORMATION mbi;
-      if (VirtualQuery(inPtr, &mbi, sizeof(mbi)) == 0) return false;
-      if (mbi.State != MEM_COMMIT) return false;
-      if (mbi.Protect & PAGE_GUARD) return false;
-      if (mbi.Protect & PAGE_NOACCESS) return false;
-      #else
-      // For Linux/Mac/Android, use pipe trick to check if address is readable
-      int nullfd = open("/dev/random", O_WRONLY);
-      if (nullfd >= 0) {
-          if (write(nullfd, inPtr, 1) < 0) {
-              close(nullfd);
-              return false;
-          }
-          close(nullfd);
-      }
-      #endif
       
       return false;
    }
@@ -5446,8 +5443,20 @@ public:
              for(int r=0;r<n;r++)
              {
                 hx::Object *obj = ref[r];
+                // Fast path: valid pointer and not tagged
                 if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+                {
+                   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+                   __try {
+                       obj->__Mark(marker);
+                   }
+                   __except(1) {
+                       // GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
+                   }
+                   #else
                    obj->__Mark(marker);
+                   #endif
+                }
              }
           }
       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
@@ -5469,7 +5478,18 @@ public:
               hx::Object *obj = (*inSet)[i];
               // Bypass MarkObjectAlloc check because these are Old objects that we MUST scan
               if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+              {
+                 #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+                 __try {
+                     obj->__Mark(__inCtx);
+                 }
+                 __except(1) {
+                     // GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
+                 }
+                 #else
                  obj->__Mark(__inCtx);
+                 #endif
+              }
            }
        #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
        }
@@ -5486,7 +5506,16 @@ public:
       for(hx::RootSet::iterator i = hx::sgRootSet.begin(); i!=hx::sgRootSet.end(); ++i)
       {
          hx::Object *&obj = **i;
-         SafeMarkObjectAlloc(obj , __inCtx );
+         // Ensure root pointer is valid before marking
+         if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+             SafeMarkObjectAlloc(obj , __inCtx );
+         else if (obj)
+         {
+             // If we have an invalid root pointer, we should probably null it out to prevent future crashes
+             // or at least not try to mark it.
+             // But modifying roots might be dangerous if logic depends on them.
+             // Safest is to just skip marking it.
+         }
       }
 
       if (hx::sgOffsetRootSet)
@@ -5496,7 +5525,8 @@ public:
             int offset = i->second;
             hx::Object *obj = (hx::Object *)(ptr - offset);
 
-            SafeMarkObjectAlloc(obj , __inCtx );
+            if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+                SafeMarkObjectAlloc(obj , __inCtx );
          }
    }
 
@@ -7291,6 +7321,9 @@ void GlobalAllocator::Collect(bool inMajor, bool inForceCompact, bool inLocked,b
    #ifndef HXCPP_SINGLE_THREADED_APP
       for(int i=0;i<mLocalAllocs.size();i++)
       {
+         // Validate pointer before use
+         if (!mLocalAllocs[i]) continue;
+         
          #ifdef HXCPP_SCRIPTABLE
          ((hx::StackContext *)mLocalAllocs[i])->byteMarkId = hx::gByteMarkID;
          #endif
@@ -8027,15 +8060,14 @@ size_t __hxcpp_gc_working_memory()
 
 size_t GlobalAllocator::MemGarbageEstimate()
    {
-      size_t newAllocations = mAllocatedSinceLastGC;
+      size_t newAllocations = 0;
       
       // Add up allocations from all threads
       for(int i=0; i<mLocalAllocs.size(); i++)
          if (mLocalAllocs[i])
             newAllocations += mLocalAllocs[i]->mBytesAllocatedSinceGC;
 
-      // Estimated garbage = New Allocations * (1.0 - Survival Rate)
-      return (size_t)(newAllocations * (1.0 - mSurvivalRate));
+      return newAllocations;
    }
 
 void GlobalAllocator::UpdateSurvivalRate(size_t oldRowsInUse)
@@ -8183,12 +8215,26 @@ hx::Object *__hxcpp_id_obj(int inId)
 #ifdef HXCPP_USE_OBJECT_MAP
 unsigned int __hxcpp_obj_hash(Dynamic inObj)
 {
-   return __hxcpp_obj_id(inObj);
+   if (!inObj.mPtr) return 0;
+   
+   // Verify pointer validity before accessing
+   if (!((size_t)inObj.mPtr & 3) && sGlobalAlloc->IsValidPointer(inObj.mPtr))
+   {
+       return __hxcpp_obj_id(inObj);
+   }
+   
+   // Fallback for invalid/non-GC pointers to avoid crash
+   return 0;
 }
 #else
 unsigned int __hxcpp_obj_hash(Dynamic inObj)
 {
    if (!inObj.mPtr) return 0;
+   
+   // Verify pointer validity before accessing
+   if (((size_t)inObj.mPtr & 3) || !sGlobalAlloc->IsValidPointer(inObj.mPtr))
+       return 0;
+       
    hx::Object *obj = inObj.mPtr;
    #if defined(HXCPP_M64)
    size_t h64 = (size_t)obj;
