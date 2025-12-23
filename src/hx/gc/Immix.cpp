@@ -5237,33 +5237,39 @@ public:
       #else
          static __thread BlockData *tLastBlock = 0;
       #endif
+      
+      // Super fast path for consecutive checks in same block
       if (block==tLastBlock) return true;
 
-      if (mAllBlocks.size())
+      // Fast rejection based on global bounds (if available)
+      if (mAllBlocks.empty()) return false;
+      
+      // Check boundaries of the sorted vector
+      BlockData *min = mAllBlocks[0]->mPtr;
+      BlockData *max = mAllBlocks[mAllBlocks.size()-1]->mPtr;
+      
+      if (block < min || block > max) return false;
+      
+      // Binary search
+      int minIdx = 0;
+      int maxIdx = mAllBlocks.size()-1;
+      
+      // Optimization: Check ends first as they are common alloc points
+      if (block == min || block == max) { tLastBlock=block; return true; }
+
+      while(minIdx <= maxIdx)
       {
-         // Fast path optimization: check common boundaries first
-         BlockData *min = mAllBlocks[0]->mPtr;
-         BlockData *max = mAllBlocks[mAllBlocks.size()-1]->mPtr;
+         int mid = (maxIdx + minIdx) >> 1;
+         BlockData *midPtr = mAllBlocks[mid]->mPtr;
          
-         if (block < min || block > max) return false;
-         if (block == min || block == max) { tLastBlock=block; return true; }
+         if (midPtr == block) { tLastBlock=block; return true; }
          
-         int minIdx = 0;
-         int maxIdx = mAllBlocks.size()-1;
-         
-         while(minIdx < maxIdx - 1)
-         {
-            int mid = (maxIdx + minIdx) >> 1;
-            BlockData *midPtr = mAllBlocks[mid]->mPtr;
-            
-            if (midPtr == block) { tLastBlock=block; return true; }
-            
-            if (midPtr < block)
-               minIdx = mid;
-            else
-               maxIdx = mid;
-         }
+         if (midPtr < block)
+            minIdx = mid + 1;
+         else
+            maxIdx = mid - 1;
       }
+      
       return false;
    }
 
@@ -5791,7 +5797,22 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
                      GCLOG(" Mark object %p (%p)\n", vptr,ptr);
                   }
                   #endif
-                  hx::MarkObjectAlloc( ((hx::Object *)vptr), __inCtx );
+
+                  #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+                  __try {
+                     void **vptr_obj = (void **)vptr;
+                     if (*vptr_obj && (size_t)(*vptr_obj) >= 0x10000)
+                        hx::MarkObjectAlloc( ((hx::Object *)vptr), __inCtx );
+                  }
+                  __except(1) {
+                      GCLOG("Warning: SEH Exception during MarkConservative on %p\n", vptr);
+                  }
+                  #else
+                     void **vptr_obj = (void **)vptr;
+                     if (*vptr_obj && (size_t)(*vptr_obj) >= 0x10000)
+                        hx::MarkObjectAlloc( ((hx::Object *)vptr), __inCtx );
+                  #endif
+                  
                   lastPin = vptr;
                   info->pin();
                }
