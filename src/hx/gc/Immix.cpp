@@ -5380,7 +5380,7 @@ public:
           }
       }
       __except(1) {
-          GCLOG("Warning: SEH Exception during MarkObjectAlloc on %p\n", obj);
+          // GCLOG("Warning: SEH Exception during MarkObjectAlloc on %p\n", obj);
       }
       #else
       if (obj && IsValidPointer(obj)) 
@@ -5400,7 +5400,7 @@ public:
           hx::MarkClassStatics(ctx);
       }
       __except(1) {
-          GCLOG("Warning: SEH Exception during MarkClassStatics\n");
+          // GCLOG("Warning: SEH Exception during MarkClassStatics\n");
       }
       #else
       hx::MarkClassStatics(ctx);
@@ -5414,7 +5414,7 @@ public:
           MarkLocalAlloc(alloc, ctx);
       }
       __except(1) {
-          GCLOG("Warning: SEH Exception during MarkLocalAlloc on allocator %p\n", alloc);
+          // GCLOG("Warning: SEH Exception during MarkLocalAlloc on allocator %p\n", alloc);
       }
       #else
       MarkLocalAlloc(alloc, ctx);
@@ -5428,7 +5428,7 @@ public:
           MarkObjectArray(inPtr, inLength, __inCtx);
       }
       __except(1) {
-          GCLOG("Warning: SEH Exception during MarkObjectArray\n");
+          // GCLOG("Warning: SEH Exception during MarkObjectArray\n");
       }
       #else
       MarkObjectArray(inPtr, inLength, __inCtx);
@@ -5444,7 +5444,7 @@ public:
           }
       }
       __except(1) {
-          GCLOG("Warning: SEH Exception checking LargeObject %p\n", blob);
+          // GCLOG("Warning: SEH Exception checking LargeObject %p\n", blob);
       }
       #else
       if (blob && (blob[1] & IMMIX_ALLOC_MARK_ID) == hx::gMarkID )
@@ -5493,7 +5493,7 @@ public:
       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
       }
       __except(1) {
-          GCLOG("Warning: SEH Exception checking Generational Referrers for thread %d\n", threadIdx);
+          // GCLOG("Warning: SEH Exception checking Generational Referrers for thread %d\n", threadIdx);
       }
       #endif
    }
@@ -5645,7 +5645,7 @@ inline void hx::MarkContext::processMarkStack()
                 }
             }
             __except(1) {
-                 GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
+                 // GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
             }
             #else
             if (sGlobalAlloc->IsValidPointer(obj))
