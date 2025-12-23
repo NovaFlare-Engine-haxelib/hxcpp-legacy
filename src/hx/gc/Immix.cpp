@@ -20,6 +20,48 @@
 #ifndef HX_WINDOWS
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <setjmp.h>
+static __thread sigjmp_buf gSehJmpBuf;
+static __thread bool gInSafeZone = false;
+static struct sigaction gOldSigSegv;
+static struct sigaction gOldSigBus;
+
+static void SehSignalHandler(int sig) {
+    if (gInSafeZone) {
+        siglongjmp(gSehJmpBuf, 1);
+    } else {
+        if (sig == SIGSEGV) {
+             if (gOldSigSegv.sa_handler != SIG_DFL && gOldSigSegv.sa_handler != SIG_IGN) {
+                 gOldSigSegv.sa_handler(sig);
+             } else {
+                 signal(sig, SIG_DFL);
+                 raise(sig);
+             }
+        }
+        else if (sig == SIGBUS) {
+             if (gOldSigBus.sa_handler != SIG_DFL && gOldSigBus.sa_handler != SIG_IGN) {
+                 gOldSigBus.sa_handler(sig);
+             } else {
+                 signal(sig, SIG_DFL);
+                 raise(sig);
+             }
+        }
+    }
+}
+
+static void InstallSehHandler() {
+    struct sigaction new_act;
+    new_act.sa_handler = SehSignalHandler;
+    sigemptyset(&new_act.sa_mask);
+    new_act.sa_flags = 0;
+    sigaction(SIGSEGV, &new_act, &gOldSigSegv);
+    sigaction(SIGBUS, &new_act, &gOldSigBus);
+}
+static void RestoreSehHandler() {
+    sigaction(SIGSEGV, &gOldSigSegv, 0);
+    sigaction(SIGBUS, &gOldSigBus, 0);
+}
 #endif
 
 
@@ -777,6 +819,7 @@ StackContext *gMainThreadContext = 0;
 
 unsigned int gImmixStartFlag[128];
 
+int gAllocMarkID = 0;
 int gMarkID = 0x10 << 24;
 int gMarkIDWithContainer = (0x10 << 24) | IMMIX_ALLOC_IS_CONTAINER;
 
@@ -2369,59 +2412,67 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
    size_t ptr_i = ((size_t)inPtr)-sizeof(int);
    unsigned int flags =  *((unsigned int *)ptr_i);
 
-   #ifdef HXCPP_GC_NURSERY
-   if (!(flags & 0xff000000))
-   {
-      #ifdef HX_GC_VERIFY_GENERATIONAL
-      if (sGcVerifyGenerational)
+      #ifdef HXCPP_GC_NURSERY
+      if (!(flags & 0xff000000))
       {
-         printf("Nursery alloc escaped generational collection %p\n", inPtr);
-         DebuggerTrap();
-      }
-      #endif
-
-      int size = flags & 0xffff;
-      // Size will be 0 for large allocs -> no need to mark block
-      if (size)
-      {
-         int start = (int)(ptr_i & IMMIX_BLOCK_OFFSET_MASK);
-         int startRow = start>>IMMIX_LINE_BITS;
-         int blockId = *(BlockIdType *)(ptr_i & IMMIX_BLOCK_BASE_MASK);
-         BlockDataInfo *info = (*gBlockInfo)[blockId];
-
-         int endRow = (start + size + sizeof(int) + IMMIX_LINE_LEN-1)>>IMMIX_LINE_BITS;
-         *(unsigned int *)ptr_i = flags = (flags & IMMIX_HEADER_PRESERVE) |
-                                          (endRow -startRow) |
-                                          (size<<IMMIX_ALLOC_SIZE_SHIFT) |
-                                          gMarkID;
-
-         unsigned int *pos = info->allocStart + startRow;
-         unsigned int val = *pos;
-         while(_hx_atomic_compare_exchange((volatile int *)pos, val,val|gImmixStartFlag[start&127]) != val)
-            val = *pos;
-
-         #ifdef HXCPP_GC_GENERATIONAL
-         info->mHasSurvivor = true;
+         #ifdef HX_GC_VERIFY_GENERATIONAL
+         if (sGcVerifyGenerational)
+         {
+            printf("Nursery alloc escaped generational collection %p\n", inPtr);
+            DebuggerTrap();
+         }
          #endif
+
+         int size = flags & 0xffff;
+         // Size will be 0 for large allocs -> no need to mark block
+         if (size)
+         {
+            int start = (int)(ptr_i & IMMIX_BLOCK_OFFSET_MASK);
+            int startRow = start>>IMMIX_LINE_BITS;
+            int blockId = *(BlockIdType *)(ptr_i & IMMIX_BLOCK_BASE_MASK);
+            BlockDataInfo *info = (*gBlockInfo)[blockId];
+
+            int endRow = (start + size + sizeof(int) + IMMIX_LINE_LEN-1)>>IMMIX_LINE_BITS;
+            *(unsigned int *)ptr_i = flags = (flags & IMMIX_HEADER_PRESERVE) |
+                                             (endRow -startRow) |
+                                             (size<<IMMIX_ALLOC_SIZE_SHIFT) |
+                                             gMarkID;
+
+            unsigned int *pos = info->allocStart + startRow;
+            unsigned int val = *pos;
+            while(_hx_atomic_compare_exchange((volatile int *)pos, val,val|gImmixStartFlag[start&127]) != val)
+               val = *pos;
+
+            #ifdef HXCPP_GC_GENERATIONAL
+            info->mHasSurvivor = true;
+            #endif
+         }
+         else
+         {
+            // Large nursury object
+            ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+         }
       }
       else
+      #endif
       {
-         // Large nursury object
+         #ifdef HX_GC_VERIFY_GENERATIONAL
+         if (sGcVerifyGenerational && ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] != gPrevByteMarkID)
+         {
+            printf("Alloc missed int generational collection %p\n", inPtr);
+            DebuggerTrap();
+         }
+         #endif
+         
+         // Fix: Check against CURRENT mark ID, not AllocMarkID
+         // If we are here, the object is NOT marked with current ID (because of gPrevMarkIdMask check in caller)
+         // But it might have gAllocMarkID (0).
+         // If gMarkID is 0, we can't use it to check "Already Marked".
+         // But we assume caller (MarkAlloc) already checked "Not Marked".
+         // So we just set the mark.
+         
          ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
       }
-   }
-   else
-   #endif
-   {
-      #ifdef HX_GC_VERIFY_GENERATIONAL
-      if (sGcVerifyGenerational && ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] != gPrevByteMarkID)
-      {
-         printf("Alloc missed int generational collection %p\n", inPtr);
-         DebuggerTrap();
-      }
-      #endif
-      ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
-   }
 
    int rows = flags & IMMIX_ALLOC_ROW_COUNT;
    if (rows)
@@ -2456,41 +2507,41 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
 {
    size_t ptr_i = ((size_t)inPtr)-sizeof(int);
    unsigned int flags =  *((unsigned int *)ptr_i);
-   #ifdef HXCPP_GC_NURSERY
-   if (!(flags & 0xff000000))
-   {
-      #if defined(HX_GC_VERIFY_GENERATIONAL)
-         if (sGcVerifyGenerational)
-         {
-            printf("Nursery object escaped generational collection %p\n", inPtr);
-            DebuggerTrap();
-         }
+      #ifdef HXCPP_GC_NURSERY
+      if (!(flags & 0xff000000))
+      {
+         #if defined(HX_GC_VERIFY_GENERATIONAL)
+            if (sGcVerifyGenerational)
+            {
+               printf("Nursery object escaped generational collection %p\n", inPtr);
+               DebuggerTrap();
+            }
+         #endif
+
+
+         int size = flags & 0xffff;
+         int start = (int)(ptr_i & IMMIX_BLOCK_OFFSET_MASK);
+         int startRow = start>>IMMIX_LINE_BITS;
+         int blockId = *(BlockIdType *)(ptr_i & IMMIX_BLOCK_BASE_MASK);
+         BlockDataInfo *info = (*gBlockInfo)[blockId];
+
+         int endRow = (start + size + sizeof(int) + IMMIX_LINE_LEN-1)>>IMMIX_LINE_BITS;
+         *(unsigned int *)ptr_i = flags = (flags & IMMIX_HEADER_PRESERVE) |
+                                          (endRow -startRow) |
+                                          (size<<IMMIX_ALLOC_SIZE_SHIFT) |
+                                          gMarkID;
+
+         unsigned int *pos = info->allocStart + startRow;
+         unsigned int val = *pos;
+         while(_hx_atomic_compare_exchange( (volatile int *)pos, val, val|gImmixStartFlag[start&127]) != val)
+            val = *pos;
+         #ifdef HXCPP_GC_GENERATIONAL
+         info->mHasSurvivor = true;
+         #endif
+      }
+      else
       #endif
-
-
-      int size = flags & 0xffff;
-      int start = (int)(ptr_i & IMMIX_BLOCK_OFFSET_MASK);
-      int startRow = start>>IMMIX_LINE_BITS;
-      int blockId = *(BlockIdType *)(ptr_i & IMMIX_BLOCK_BASE_MASK);
-      BlockDataInfo *info = (*gBlockInfo)[blockId];
-
-      int endRow = (start + size + sizeof(int) + IMMIX_LINE_LEN-1)>>IMMIX_LINE_BITS;
-      *(unsigned int *)ptr_i = flags = (flags & IMMIX_HEADER_PRESERVE) |
-                                       (endRow -startRow) |
-                                       (size<<IMMIX_ALLOC_SIZE_SHIFT) |
-                                       gMarkID;
-
-      unsigned int *pos = info->allocStart + startRow;
-      unsigned int val = *pos;
-      while(_hx_atomic_compare_exchange( (volatile int *)pos, val, val|gImmixStartFlag[start&127]) != val)
-         val = *pos;
-      #ifdef HXCPP_GC_GENERATIONAL
-      info->mHasSurvivor = true;
-      #endif
-   }
-   else
-   #endif
-      ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+         ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
 
    int rows = flags & IMMIX_ALLOC_ROW_COUNT;
    if (rows)
@@ -4926,6 +4977,10 @@ public:
    double tMarked;
    void MarkAll(bool inGenerational, hx::QuickVec<hx::Object *> *inRememberedSet = 0)
    {
+      #ifndef HX_WINDOWS
+      InstallSehHandler();
+      #endif
+
       if (!inGenerational)
       {
          hx::gPrevByteMarkID = hx::gByteMarkID;
@@ -4947,6 +5002,7 @@ public:
          else
             gByteMarkID |= 0x10;
 
+         hx::gAllocMarkID = 0;
          hx::gMarkID = gByteMarkID << 24;
          hx::gMarkIDWithContainer = (gByteMarkID << 24) | IMMIX_ALLOC_IS_CONTAINER;
          gRememberedByteMarkID = gByteMarkID | HX_GC_REMEMBERED;
@@ -5064,6 +5120,10 @@ public:
          GCLOG("********* Watch mark : %p %08x\n",*watch, ((unsigned int *)*watch)[-1]);
          GCLOG(" ******** is marked  : %d\n", (((unsigned char *)(*watch))[HX_ENDIAN_MARK_ID_BYTE]== gByteMarkID));
       }
+      #endif
+      
+      #ifndef HX_WINDOWS
+      RestoreSehHandler();
       #endif
    }
 
@@ -5383,12 +5443,18 @@ public:
           // GCLOG("Warning: SEH Exception during MarkObjectAlloc on %p\n", obj);
       }
       #else
-      if (obj && IsValidPointer(obj)) 
-      {
-          // VTable check for safety
-          void **vptr = (void **)obj;
-          if (*vptr && (size_t)(*vptr) >= 0x10000)
-             hx::MarkObjectAlloc(obj, ctx);
+      if (sigsetjmp(gSehJmpBuf, 1) == 0) {
+         gInSafeZone = true;
+         if (obj && IsValidPointer(obj)) 
+         {
+             // VTable check for safety
+             void **vptr = (void **)obj;
+             if (*vptr && (size_t)(*vptr) >= 0x10000)
+                hx::MarkObjectAlloc(obj, ctx);
+         }
+         gInSafeZone = false;
+      } else {
+         gInSafeZone = false;
       }
       #endif
    }
@@ -5403,7 +5469,13 @@ public:
           // GCLOG("Warning: SEH Exception during MarkClassStatics\n");
       }
       #else
-      hx::MarkClassStatics(ctx);
+      if (sigsetjmp(gSehJmpBuf, 1) == 0) {
+         gInSafeZone = true;
+         hx::MarkClassStatics(ctx);
+         gInSafeZone = false;
+      } else {
+         gInSafeZone = false;
+      }
       #endif
    }
 
@@ -5417,7 +5489,13 @@ public:
           // GCLOG("Warning: SEH Exception during MarkLocalAlloc on allocator %p\n", alloc);
       }
       #else
-      MarkLocalAlloc(alloc, ctx);
+      if (sigsetjmp(gSehJmpBuf, 1) == 0) {
+         gInSafeZone = true;
+         MarkLocalAlloc(alloc, ctx);
+         gInSafeZone = false;
+      } else {
+         gInSafeZone = false;
+      }
       #endif
    }
 
@@ -5431,7 +5509,13 @@ public:
           // GCLOG("Warning: SEH Exception during MarkObjectArray\n");
       }
       #else
-      MarkObjectArray(inPtr, inLength, __inCtx);
+      if (sigsetjmp(gSehJmpBuf, 1) == 0) {
+         gInSafeZone = true;
+         MarkObjectArray(inPtr, inLength, __inCtx);
+         gInSafeZone = false;
+      } else {
+         gInSafeZone = false;
+      }
       #endif
    }
 
@@ -5447,8 +5531,14 @@ public:
           // GCLOG("Warning: SEH Exception checking LargeObject %p\n", blob);
       }
       #else
-      if (blob && (blob[1] & IMMIX_ALLOC_MARK_ID) == hx::gMarkID )
-      {
+      if (sigsetjmp(gSehJmpBuf, 1) == 0) {
+         gInSafeZone = true;
+         if (blob && (blob[1] & IMMIX_ALLOC_MARK_ID) == hx::gMarkID )
+         {
+         }
+         gInSafeZone = false;
+      } else {
+         gInSafeZone = false;
       }
       #endif
    }
@@ -5457,6 +5547,9 @@ public:
    {
       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
       __try {
+      #elif !defined(HX_WINDOWS)
+      if (sigsetjmp(gSehJmpBuf, 1) == 0) {
+         gInSafeZone = true;
       #endif
           if (ctx->mOldReferrers && ctx->mOldReferrers->count)
           {
@@ -5465,6 +5558,9 @@ public:
              if (n < 0 || n > 10000000) 
              {
                  GCLOG("Warning: Suspicious referrer count %d, skipping.\n", n);
+                 #ifndef HX_WINDOWS
+                 gInSafeZone = false;
+                 #endif
                  return;
              }
 
@@ -5495,6 +5591,12 @@ public:
       __except(1) {
           // GCLOG("Warning: SEH Exception checking Generational Referrers for thread %d\n", threadIdx);
       }
+      #elif !defined(HX_WINDOWS)
+      gInSafeZone = false;
+      } else {
+          gInSafeZone = false;
+          GCLOG("Warning: Signal caught checking Generational Referrers for thread %d\n", threadIdx);
+      }
       #endif
    }
 
@@ -5503,6 +5605,9 @@ public:
        if (!inSet) return;
        #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
        __try {
+       #elif !defined(HX_WINDOWS)
+       if (sigsetjmp(gSehJmpBuf, 1) == 0) {
+          gInSafeZone = true;
        #endif
            for(int i=0;i<inSet->size();i++)
            {
@@ -5530,6 +5635,12 @@ public:
        }
        __except(1) {
            GCLOG("Warning: SEH Exception during MarkRememberedSet\n");
+       }
+       #elif !defined(HX_WINDOWS)
+       gInSafeZone = false;
+       } else {
+           gInSafeZone = false;
+           GCLOG("Warning: Signal caught during MarkRememberedSet\n");
        }
        #endif
    }
@@ -5648,11 +5759,17 @@ inline void hx::MarkContext::processMarkStack()
                  // GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
             }
             #else
-            if (sGlobalAlloc->IsValidPointer(obj))
-            {
-                void **vptr = (void **)obj;
-                if (*vptr && (size_t)(*vptr) >= 0x10000)
-                   obj->__Mark(this);
+            if (sigsetjmp(gSehJmpBuf, 1) == 0) {
+                gInSafeZone = true;
+                if (sGlobalAlloc->IsValidPointer(obj))
+                {
+                    void **vptr = (void **)obj;
+                    if (*vptr && (size_t)(*vptr) >= 0x10000)
+                       obj->__Mark(this);
+                }
+                gInSafeZone = false;
+            } else {
+                gInSafeZone = false;
             }
             #endif
 
