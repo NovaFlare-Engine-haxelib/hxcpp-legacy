@@ -75,6 +75,14 @@ enum { gAlwaysMove = false };
 
 // #define HXCPP_GC_BIG_BLOCKS
 
+#if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+   #define HX_SEH_TRY __try
+   #define HX_SEH_CATCH_ALL __except(1)
+#else
+   #define HX_SEH_TRY try
+   #define HX_SEH_CATCH_ALL catch(...)
+#endif
+
 
 #ifndef __has_builtin
 #define __has_builtin(x) 0
@@ -3457,7 +3465,7 @@ static __thread sigjmp_buf *t_mark_jmp_buf = 0;
 static struct sigaction g_old_sa_segv;
 static struct sigaction g_old_sa_bus;
 static bool g_handlers_installed = false;
-static hx::HxMutex g_handler_init_mutex;
+static HxMutex g_handler_init_mutex;
 
 static void mark_sig_handler(int sig) {
    if (t_mark_jmp_buf) {
@@ -5488,7 +5496,7 @@ public:
 
    // Helpers for Exception Handling
    bool SafeCheckAndMarkObjectAllocTry(hx::Object *obj, hx::MarkContext *ctx) {
-       try {
+       HX_SEH_TRY {
           void **vptr = (void **)obj;
           // VTable check for safety
           if (!vptr || (size_t)(*vptr) < 0x10000) return false;
@@ -5506,82 +5514,75 @@ public:
              return true;
           }
           return false;
-       } catch(...) { return false; }
+       } HX_SEH_CATCH_ALL { return false; }
    }
 
    static void SafeMarkClassStaticsTry(hx::MarkContext *ctx) {
-       try {
+       HX_SEH_TRY {
            hx::MarkClassStatics(ctx);
-       } catch(...) { }
+       } HX_SEH_CATCH_ALL { }
    }
 
    static void SafeMarkLocalAllocTry(LocalAllocator *alloc, hx::MarkContext *ctx) {
-       try {
+       HX_SEH_TRY {
            MarkLocalAlloc(alloc, ctx);
-       } catch(...) { }
+       } HX_SEH_CATCH_ALL { }
    }
 
    static void SafeMarkObjectArrayTry(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx) {
-       try {
+       HX_SEH_TRY {
            MarkObjectArray(inPtr, inLength, __inCtx);
-       } catch(...) { }
+       } HX_SEH_CATCH_ALL { }
    }
 
    static void CheckLargeObjectSafeTry(unsigned int *blob) {
-       try {
+       HX_SEH_TRY {
            if (blob && (blob[1] & IMMIX_ALLOC_MARK_ID) == hx::gMarkID ) { }
-       } catch(...) { }
+       } HX_SEH_CATCH_ALL { }
    }
 
    void SafeCheckAndMarkTry(hx::Object *obj, hx::MarkContext *marker) {
-       try {
+       HX_SEH_TRY {
            void **vptr = (void **)obj;
            if (!*vptr || (size_t)(*vptr) < 0x10000) return;
            SafeMark(obj, marker);
-       } catch(...) { }
+       } HX_SEH_CATCH_ALL { }
    }
 
    void MarkRememberedObjectTry(hx::Object *obj, hx::MarkContext *ctx) {
-       try {
+       HX_SEH_TRY {
            void **vptr = (void **)obj;
            if (!*vptr || (size_t)(*vptr) < 0x10000) return;
            SafeMark(obj, ctx);
-       } catch(...) { }
+       } HX_SEH_CATCH_ALL { }
    }
 
    static void MarkRememberedObjectTryDirect(hx::Object *obj, hx::MarkContext *ctx) {
-       try {
+       HX_SEH_TRY {
            void **vptr = (void **)obj;
            if (!*vptr || (size_t)(*vptr) < 0x10000) return;
            obj->__Mark(ctx);
-       } catch(...) { }
+       } HX_SEH_CATCH_ALL { }
    }
 
    static void FindZombiesTry(hx::MarkContext *ctx) {
-       try {
+       HX_SEH_TRY {
            hx::FindZombies(*ctx);
-       } catch(...) { }
+       } HX_SEH_CATCH_ALL { }
    }
 
    static void RunFinalizersTry() {
-       try {
+       HX_SEH_TRY {
            hx::RunFinalizers();
-       } catch(...) { }
+       } HX_SEH_CATCH_ALL { }
    }
 
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   __declspec(noinline)
-   #endif
    void SafeMarkObjectAllocInternal(hx::Object *obj, hx::MarkContext *ctx)
    {
-       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-       try {
+       HX_SEH_TRY {
            MarkObjectAlloc(obj, ctx);
-       } catch(...) {
+       } HX_SEH_CATCH_ALL {
        }
-       #else
-       MarkObjectAlloc(obj, ctx);
-       #endif
    }
 
    bool SafeMarkObjectAlloc(hx::Object *obj, hx::MarkContext *ctx)
@@ -5698,19 +5699,12 @@ public:
       #endif
    }
 
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   __declspec(noinline)
-   #endif
    void SafeMark(hx::Object *obj, hx::MarkContext *ctx)
    {
-       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-       try {
+       HX_SEH_TRY {
            obj->__Mark(ctx);
-       } catch(...) {
+       } HX_SEH_CATCH_ALL {
        }
-       #else
-       obj->__Mark(ctx);
-       #endif
    }
 
    void CheckGenerationalReferrersSafe(hx::StackContext *ctx, hx::MarkContext *marker, int threadIdx)
@@ -5775,33 +5769,20 @@ public:
        if (!outerSafeMark.SetJmp()) return;
        #endif
 
-       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-       __try {
-       #endif
+       HX_SEH_TRY {
            for(int i=0;i<inSet->size();i++)
            {
               hx::Object *obj = (*inSet)[i];
               // Bypass MarkObjectAlloc check because these are Old objects that we MUST scan
               if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
               {
-                 #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-                 __try {
-                     MarkRememberedObjectTry(obj, __inCtx);
-                 }
-                 __except(1) {
-                     // GCLOG("Warning: SEH Exception during __Mark on %p\n", obj);
-                 }
-                 #else
-                 MarkRememberedObjectTryDirect(obj, __inCtx);
-                 #endif
+                 MarkRememberedObjectTry(obj, __inCtx);
               }
            }
-       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
        }
-       __except(1) {
+       HX_SEH_CATCH_ALL {
            GCLOG("Warning: SEH Exception during MarkRememberedSet\n");
        }
-       #endif
    }
 
    void MarkRoots(hx::MarkContext *__inCtx)
@@ -5860,16 +5841,12 @@ public:
 
    void FindZombiesSafe(hx::MarkContext *__inCtx)
    {
-       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-       __try {
+       HX_SEH_TRY {
            FindZombiesTry(__inCtx);
        }
-       __except(1) {
+       HX_SEH_CATCH_ALL {
            GCLOG("Warning: SEH Exception during FindZombies\n");
        }
-       #else
-       FindZombiesTry(__inCtx);
-       #endif
    }
 
    void RunFinalizersSafe()
@@ -5978,19 +5955,19 @@ MarkChunk *MarkChunk::swapForNew()
 }
 
 static void MarkObjectAllocTry(hx::Object *obj, hx::MarkContext *__inCtx) {
-    try {
+    HX_SEH_TRY {
         void **vptr_obj = (void **)obj;
         if (*vptr_obj && (size_t)(*vptr_obj) >= 0x10000)
            hx::MarkObjectAlloc( obj, __inCtx );
-    } catch(...) { }
+    } HX_SEH_CATCH_ALL { }
 }
 
 static void MarkObjectAllocUncheckedTry(hx::Object *obj, hx::MarkContext *__inCtx) {
-    try {
+    HX_SEH_TRY {
         void **vptr_obj = (void **)obj;
         if (*vptr_obj && (size_t)(*vptr_obj) >= 0x10000)
            hx::MarkObjectAllocUnchecked( obj, __inCtx );
-    } catch(...) { }
+    } HX_SEH_CATCH_ALL { }
 }
 
 
