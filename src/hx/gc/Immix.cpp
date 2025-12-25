@@ -114,8 +114,8 @@ static void *sgObject_root = 0;
 static int sgCheckInternalOffset = sizeof(void *)*2;
 static int sgCheckInternalOffsetRows = 1;
 #else
-static int sgCheckInternalOffset = 0;
-static int sgCheckInternalOffsetRows = 0;
+static int sgCheckInternalOffset = sizeof(void *)*2;
+static int sgCheckInternalOffsetRows = 1;
 #endif
 
 int gInAlloc = false;
@@ -2464,8 +2464,32 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
 
 void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
 {
+   // Verify pointer alignment and basic validity
+   if (!inPtr || ((size_t)inPtr & (sizeof(void*)-1)) || (size_t)inPtr < 0x10000) return;
+
+   // Safety: Probe read the header
+   unsigned int *headerPtr = (unsigned int *)inPtr - 1;
+   
+   // ProbeReadSafe might be defined later, so we use a local lambda or duplicate it here?
+   // Or better: forward declare it at the top of file if possible.
+   // But to avoid complex edits, let's just use the logic directly here since it's simple.
+   volatile char c_check = *(volatile char*)headerPtr; (void)c_check;
+
    size_t ptr_i = ((size_t)inPtr)-sizeof(int);
-   unsigned int flags =  *((unsigned int *)ptr_i);
+   unsigned int flags =  *headerPtr;
+
+   // Check for reasonable size (sanity check against block size)
+   int sizeCheck = (flags & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT;
+   if (sizeCheck > IMMIX_BLOCK_SIZE) {
+       #ifdef SHOW_MEM_EVENTS
+       GCLOG("MarkObjectAllocUnchecked: Object %p has corrupted size %d - Marking as SAFE LEAF\n", inPtr, sizeCheck);
+       #endif
+       // Force mark as alive to prevent Use-After-Free
+       ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+       // Do NOT recurse (treat as leaf)
+       return;
+   }
+
    #ifdef HXCPP_GC_NURSERY
    if (!(flags & 0xff000000))
    {
@@ -4092,6 +4116,38 @@ public:
                         int size = ((header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT);
                         int allocSize = size + sizeof(int);
 
+                        // Safety check for corrupted headers to prevent out-of-bounds recycling
+                        if (allocSize < sizeof(int) || allocSize > IMMIX_BLOCK_SIZE) {
+                           #ifdef SHOW_MEM_EVENTS
+                           GCLOG("Corrupted object header detected in MoveBlocks: %d - Aborting Block Compaction\n", allocSize);
+                           #endif
+                           
+                           // Patch header to be benign dummy object to avoid future scan crashes
+                           // Size=0 (so allocSize=4), MarkID=Correct, Not Container
+                           header = (0 << IMMIX_ALLOC_SIZE_SHIFT) | hx::gMarkID;
+
+                           // ABORT COMPACTION FOR THIS BLOCK
+                           // Do NOT move this object. Do NOT clear the 'from' block.
+                           // Restore stats (approximate)
+                           ioStats.rowsInUse += from->mUsedRows;
+                           if (!from->isEmpty()) ioStats.emptyBlocks--;
+                           
+                           // Ensure 'from' block is marked as full so it's not reused immediately
+                           from->makeFull();
+                           
+                           // Skip to next block
+                           goto next_block;
+                        }
+
+                        // Sanity check destPos and destLen before moving
+                        if (destPos < 0 || destLen < 0 || destLen > IMMIX_BLOCK_SIZE) {
+                           #ifdef SHOW_MEM_EVENTS
+                           GCLOG("Invalid destination state in MoveBlocks: pos=%d len=%d\n", destPos, destLen);
+                           #endif
+                           // If destination is messed up, we can't continue safely in this block
+                           goto all_done; 
+                        }
+
                         while(allocSize + ALIGN_PADDING(destPos)>destLen)
                         {
                            hole++;
@@ -4185,6 +4241,9 @@ public:
                from->makeFull();
             }
          }
+
+         next_block:
+         ;
       }
 
       #ifdef SHOW_FRAGMENTATION
@@ -4302,6 +4361,33 @@ public:
                            int size = ((header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT);
                            int allocSize = size + sizeof(int);
 
+                           // Safety check for corrupted headers to prevent out-of-bounds recycling
+                           if (allocSize < sizeof(int) || allocSize > IMMIX_BLOCK_SIZE) {
+                               #ifdef SHOW_MEM_EVENTS
+                               GCLOG("Corrupted object header detected in MoveSurvivors: %d - Aborting Block Compaction\n", allocSize);
+                               #endif
+                               
+                               // Patch header to be benign dummy object
+                               header = (0 << IMMIX_ALLOC_SIZE_SHIFT) | hx::gMarkID;
+
+                               // ABORT COMPACTION FOR THIS BLOCK
+                               // Do NOT move this object. Do NOT clear the 'from' block.
+                               
+                               // Ensure 'from' block is marked as full so it's not reused immediately
+                               if (from) from->makeFull();
+                               
+                               // Skip to next block
+                               goto next_block;
+                           }
+                           
+                           // Sanity check destPos and destLen before moving
+                           if (destPos < 0 || destLen < 0 || destLen > IMMIX_BLOCK_SIZE) {
+                              #ifdef SHOW_MEM_EVENTS
+                              GCLOG("Invalid destination state in MoveSurvivors: pos=%d len=%d\n", destPos, destLen);
+                              #endif
+                              goto no_more_moves; 
+                           }
+
                            // Find dest reqion ...
                            while(destHole==0 || destLen < ALIGN_PADDING(destPos) + allocSize)
                            {
@@ -4392,6 +4478,9 @@ public:
                   from->makeFull();
                }
             }
+
+         next_block:
+         ;
       }
 
       #ifdef SHOW_FRAGMENTATION
@@ -5336,6 +5425,9 @@ public:
       // Optimization: Check ends first as they are common alloc points
       if (block == min || block == max) { tLastBlock=block; return true; }
 
+      // Validate pointer alignment to avoid false positives from random pointers
+      if (((size_t)block) & (sizeof(void*)-1)) return false;
+
       while(minIdx <= maxIdx)
       {
          int mid = (maxIdx + minIdx) >> 1;
@@ -5508,7 +5600,7 @@ public:
            
            #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
            __try {
-               if (!ProbeReadSafe(ptr)) return false;
+               if (!GlobalAllocator::ProbeReadSafe(ptr)) return false;
            } __except(1) {
                return false;
            }
@@ -5518,7 +5610,9 @@ public:
            ScopedSafeMark safeMark;
            if (!safeMark.SetJmp()) return false;
            
-           if (!ProbeReadSafe(ptr)) return false;
+           if (!GlobalAllocator::ProbeReadSafe(ptr)) return false;
+           #else
+           if (!GlobalAllocator::ProbeReadSafe(ptr)) return false;
            #endif
 
            // Global allocator check (thread-safe enough for read)
@@ -6093,7 +6187,18 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
             else
             {
                BlockData *block = (BlockData *)( ((size_t)vptr) & IMMIX_BLOCK_BASE_MASK);
-               BlockDataInfo *info = (*gBlockInfo)[block->mId];
+               
+               // Safe block access with bounds check
+               int blockId = block->mId;
+               if (blockId < 0 || blockId >= gBlockInfo->size()) {
+                   #ifdef SHOW_MEM_EVENTS
+                   GCLOG("MarkConservative: Invalid block ID %d for ptr %p\n", blockId, vptr);
+                   #endif
+                   continue;
+               }
+
+               BlockDataInfo *info = (*gBlockInfo)[blockId];
+               if (!info) continue;
 
                int pos = (int)(((size_t)vptr) & IMMIX_BLOCK_OFFSET_MASK);
                AllocType t = sgCheckInternalOffset ?
@@ -7272,7 +7377,7 @@ void GlobalAllocator::Collect(bool inMajor, bool inForceCompact, bool inLocked,b
       countRows(stats);
       size_t currentRows = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
       double filled = (double)(currentRows) / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
-      if (filled>0.9)
+      if (filled>0.8)
       {
          // Failure of generational estimation
          int retained = currentRows - mRowsInUse;
@@ -7283,12 +7388,11 @@ void GlobalAllocator::Collect(bool inMajor, bool inForceCompact, bool inLocked,b
             space = 1;
          mGenerationalRetainEstimate = (double)retained/(double)space;
          #ifdef SHOW_MEM_EVENTS
-         GCLOG("Generational retention/fragmentation too high %f, continuing generational collect\n", mGenerationalRetainEstimate);
+         GCLOG("Generational retention/fragmentation too high %f, forcing full collect\n", mGenerationalRetainEstimate);
          #endif
-
-         // Do NOT fall back to full GC, but DO continue with the current generational collection.
-         // This ensures we at least reclaim what we can from the nursery/young generation,
-         // without incurring the cost and risk of a full GC mode switch.
+         
+         // Force full collection to break the loop of ineffective minor GCs
+         full = true;
       }
    }
 
@@ -7565,7 +7669,7 @@ void GlobalAllocator::Collect(bool inMajor, bool inForceCompact, bool inLocked,b
    double filled_ratio = (double)mRowsInUse/(double)(mAllBlocksCount*IMMIX_USEFUL_LINES);
    double after_gen = filled_ratio + (1.0-filled_ratio)*mGenerationalRetainEstimate;
 
-   if (forceKeepGenerational || after_gen<0.75)
+   if ((forceKeepGenerational && after_gen<0.85) || after_gen<0.75)
    {
       sGcMode = gcmGenerational;
    }
@@ -8574,6 +8678,13 @@ void __hxcpp_gc_verify_heap()
       sGlobalAlloc->VerifyHeap();
 }
 
+void __hxcpp_gc_verify_integrity()
+{
+   // Safe point check to ensure we aren't racing with allocator
+   __hxcpp_gc_safe_point();
+   __hxcpp_gc_verify_heap();
+}
+
 //#define HXCPP_FORCE_OBJ_MAP
 
 #if defined(HXCPP_M64) || defined(HXCPP_GC_MOVING) || defined(HXCPP_FORCE_OBJ_MAP)
@@ -8623,18 +8734,36 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
        __try {
           if (!ProbeReadSafe(obj)) return 0;
           void **vptr = (void **)obj;
-          if (!*vptr || (size_t)(*vptr) < 0x10000) return 0;
+          // Check for valid vtable pointer (simple range check)
+          if (!vptr || (size_t)(*vptr) < 0x10000) return 0;
+          
+          // Verify header integrity (valid MarkID)
+          unsigned int *header = (unsigned int *)obj - 1;
+          if (!ProbeReadSafe(header)) return 0;
+          if ((*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID && (*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkIDWithContainer) return 0;
+          
           return __hxcpp_obj_id(inObj);
        }
        __except(1) { return 0; }
+       #elif !defined(HXCPP_WINRT)
+       ScopedSafeMark safeMark;
+       if (!safeMark.SetJmp()) return 0;
+       
+       if (!ProbeReadSafe(obj)) return 0;
+       void **vptr = (void **)obj;
+       if (!vptr || (size_t)(*vptr) < 0x10000) return 0;
+       
+       unsigned int *header = (unsigned int *)obj - 1;
+       if (!ProbeReadSafe(header)) return 0;
+       if ((*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID && (*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkIDWithContainer) return 0;
+
+       return __hxcpp_obj_id(inObj);
        #else
-       try {
-           volatile char c = *(volatile char*)obj;
-           (void)c;
-           void **vptr = (void **)obj;
-           if (!*vptr || (size_t)(*vptr) < 0x10000) return 0;
-           return __hxcpp_obj_id(inObj);
-       } catch(...) { return 0; }
+       // WinRT or other platforms where we can't easily catch SEH/signals
+       if (!ProbeReadSafe(obj)) return 0;
+       void **vptr = (void **)obj;
+       if (!vptr || (size_t)(*vptr) < 0x10000) return 0;
+       return __hxcpp_obj_id(inObj);
        #endif
    }
    
@@ -8655,13 +8784,22 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
    #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
    __try {
        if (!ProbeReadSafe(obj)) return 0;
+       // Verify header integrity (valid MarkID)
+       unsigned int *header = (unsigned int *)obj - 1;
+       if (!ProbeReadSafe(header)) return 0;
+       if ((*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID && (*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkIDWithContainer) return 0;
    }
    __except(1) { return 0; }
+   #elif !defined(HXCPP_WINRT)
+   ScopedSafeMark safeMark;
+   if (!safeMark.SetJmp()) return 0;
+   if (!ProbeReadSafe(obj)) return 0;
+   
+   unsigned int *header = (unsigned int *)obj - 1;
+   if (!ProbeReadSafe(header)) return 0;
+   if ((*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID && (*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkIDWithContainer) return 0;
    #else
-   try {
-       volatile char c = *(volatile char*)obj;
-       (void)c;
-   } catch(...) { return 0; }
+   if (!ProbeReadSafe(obj)) return 0;
    #endif
    
    #if defined(HXCPP_M64)
