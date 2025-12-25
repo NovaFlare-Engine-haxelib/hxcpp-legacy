@@ -5352,6 +5352,33 @@ public:
       return false;
    }
 
+   static bool ProbeReadSafe(void *ptr) {
+       // On Windows, try/catch(...) catches nothing useful unless /EHa is on.
+       // The caller (IsValid) uses __try, so this is fine.
+       // On POSIX, ScopedSafeMark handles the signal.
+       volatile char c = *(volatile char*)ptr;
+       (void)c;
+       return true;
+   }
+
+   static bool IsHeaderValidSafe(unsigned int *header)
+   {
+      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+      __try {
+         if (!ProbeReadSafe(header)) return false;
+      } __except(1) { return false; }
+      return true;
+      #elif !defined(HXCPP_WINRT)
+      ScopedSafeMark safeMark;
+      if (!safeMark.SetJmp()) return false;
+      if (!ProbeReadSafe(header)) return false;
+      return true;
+      #else
+      if (!ProbeReadSafe(header)) return false;
+      return true;
+      #endif
+   }
+
    bool IsValidPointer(void *inPtr)
    {
       if (!inPtr) return false;
@@ -5370,6 +5397,8 @@ public:
           
           unsigned int *header = (unsigned int *)((char *)inPtr - sizeof(int));
           
+          if (!IsHeaderValidSafe(header)) return false;
+          
           unsigned int flags = *header;
           if ((flags & 0xffff) == 0) return false;
           
@@ -5377,13 +5406,39 @@ public:
       }
 
       // Check large objects
-      for(int i=0;i<mLargeList.size();i++)
       {
-         unsigned int *blob = mLargeList[i] + 2;
-         if (blob==inPtr) return true;
+         AutoLock lock(mLargeListLock);
+         for(int i=0;i<mLargeList.size();i++)
+         {
+            unsigned int *blob = mLargeList[i] + 2;
+            if (blob==inPtr) return true;
+         }
       }
       
       return false;
+   }
+
+   void VerifyHeap()
+   {
+       // System scan for corrupted objects
+       AutoLock lock(mLargeListLock);
+       int errors = 0;
+       
+       for(int i=0;i<mLargeList.size();i++)
+       {
+           unsigned int *blob = mLargeList[i] + 2;
+           if (!IsValidPointer(blob))
+           {
+               GCLOG("CORRUPTION: Large Object %p is invalid\n", blob);
+               errors++;
+           }
+       }
+       
+       if (errors > 0)
+       {
+           GCLOG("Heap Verification failed with %d errors\n", errors);
+           DebuggerTrap();
+       }
    }
 
    MemType GetMemType(void *inPtr)
@@ -5391,26 +5446,18 @@ public:
       BlockData *block = (BlockData *)( ((size_t)inPtr) & IMMIX_BLOCK_BASE_MASK);
 
       bool isBlock = IsAllBlock(block);
-      /*
-      bool found = false;
-      for(int i=0;i<mAllBlocks.size();i++)
-      {
-         if (mAllBlocks[i]==block)
-         {
-            found = true;
-            break;
-         }
-      }
-      */
 
       if (isBlock)
          return memBlock;
 
-      for(int i=0;i<mLargeList.size();i++)
       {
-         unsigned int *blob = mLargeList[i] + 2;
-         if (blob==inPtr)
-            return memLarge;
+         AutoLock lock(mLargeListLock);
+         for(int i=0;i<mLargeList.size();i++)
+         {
+            unsigned int *blob = mLargeList[i] + 2;
+            if (blob==inPtr)
+               return memLarge;
+         }
       }
 
       return memUnmanaged;
@@ -5448,15 +5495,6 @@ public:
    hx::QuickVec<unsigned int *> largeObjectRecycle;
 
    // Use smart pointer logic to validate and protect access
-   static bool ProbeReadSafe(void *ptr) {
-       // On Windows, try/catch(...) catches nothing useful unless /EHa is on.
-       // The caller (IsValid) uses __try, so this is fine.
-       // On POSIX, ScopedSafeMark handles the signal.
-       volatile char c = *(volatile char*)ptr;
-       (void)c;
-       return true;
-   }
-
    template <typename T>
    class SafeGCPtr {
       T* ptr;
@@ -8530,6 +8568,12 @@ void __hxcpp_gc_safe_point()
       hx::PauseForCollect();
 }
 
+void __hxcpp_gc_verify_heap()
+{
+   if (sGlobalAlloc)
+      sGlobalAlloc->VerifyHeap();
+}
+
 //#define HXCPP_FORCE_OBJ_MAP
 
 #if defined(HXCPP_M64) || defined(HXCPP_GC_MOVING) || defined(HXCPP_FORCE_OBJ_MAP)
@@ -8550,11 +8594,9 @@ int __hxcpp_obj_id(Dynamic inObj)
 unsigned int __hxcpp_obj_hash(Dynamic inObj);
 
 static bool ProbeReadSafe(void *ptr) {
-    try {
-        volatile char c = *(volatile char*)ptr;
-        (void)c;
-        return true;
-    } catch(...) { return false; }
+    volatile char c = *(volatile char*)ptr;
+    (void)c;
+    return true;
 }
 
 hx::Object *__hxcpp_id_obj(int inId)
