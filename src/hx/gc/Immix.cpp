@@ -389,12 +389,12 @@ static bool sGcVerifyGenerational = false;
 
 #if HX_HAS_ATOMIC && (HXCPP_GC_DEBUG_LEVEL==0) && !defined(HXCPP_GC_VERIFY) && !defined(EMSCRIPTEN)
   #if defined(HX_MACOS) || defined(HX_WINDOWS) || defined(HX_LINUX)
-  enum { MAX_GC_THREADS = 8 };
+  enum { MAX_GC_THREADS = 64 };
   #else
-  enum { MAX_GC_THREADS = 8 };
+  enum { MAX_GC_THREADS = 64 };
   #endif
 #else
-  enum { MAX_GC_THREADS = 8 };
+  enum { MAX_GC_THREADS = 64 };
 #endif
 
 #ifdef HX_WINDOWS
@@ -961,8 +961,8 @@ typedef HxSemaphore ThreadPoolSignal;
 typedef TAutoLock<ThreadPoolLock> ThreadPoolAutoLock;
 
 // For threaded marking/block reclaiming
-static unsigned int sRunningThreads = 0;
-static unsigned int sAllThreads = 0;
+static unsigned long long sRunningThreads = 0;
+static unsigned long long sAllThreads = 0;
 static bool sLazyThreads = false;
 static bool sThreadPoolInit = false;
 
@@ -1003,7 +1003,7 @@ static inline void SignalThreadPool(ThreadPoolSignal &ioSignal, bool sThreadSlee
 
 static void wakeThreadLocked(int inThreadId)
 {
-   sRunningThreads |= (1<<inThreadId);
+   sRunningThreads |= ((unsigned long long)1<<inThreadId);
    sLazyThreads = sRunningThreads != sAllThreads;
    SignalThreadPool(sThreadWake[inThreadId],sThreadSleeping[inThreadId]);
 }
@@ -1929,29 +1929,17 @@ struct GlobalChunks
       if (MAX_GC_THREADS>1 && sLazyThreads)
       {
          ThreadPoolAutoLock l(sThreadPoolLock);
-
-         #ifdef PROFILE_THREAD_USAGE
-           #define CHECK_THREAD_WAKE(tid) \
-            if (MAX_GC_THREADS >tid && sgThreadCount>tid && (!(sRunningThreads & (1<<tid)))) { \
-            wakeThreadLocked(tid); \
-            sThreadChunkWakes++; \
-           } 
-         #else
-           #define CHECK_THREAD_WAKE(tid)  \
-            if (MAX_GC_THREADS >tid && sgThreadCount>tid && (!(sRunningThreads & (1<<tid)))) { \
-            wakeThreadLocked(tid); \
-           }
-         #endif
-
-
-         CHECK_THREAD_WAKE(0)
-         else CHECK_THREAD_WAKE(1)
-         else CHECK_THREAD_WAKE(2)
-         else CHECK_THREAD_WAKE(3)
-         else CHECK_THREAD_WAKE(4)
-         else CHECK_THREAD_WAKE(5)
-         else CHECK_THREAD_WAKE(6)
-         else CHECK_THREAD_WAKE(7)
+         for(int tid=0; tid<sgThreadCount; tid++)
+         {
+             if ( !(sRunningThreads & ((unsigned long long)1<<tid)) )
+             {
+                 wakeThreadLocked(tid);
+                 #ifdef PROFILE_THREAD_USAGE
+                 sThreadChunkWakes++;
+                 #endif
+                 break;
+             }
+         }
       }
 
       if (inAndAlloc)
@@ -2068,12 +2056,12 @@ struct GlobalChunks
 
    void completeThreadLocked(int inThreadId)
    {
-      if (!(sRunningThreads & (1<<inThreadId)))
+      if (!(sRunningThreads & ((unsigned long long)1<<inThreadId)))
       {
          printf("Complete non-running thread?\n");
          DebuggerTrap();
       }
-      sRunningThreads &= ~(1<<inThreadId);
+      sRunningThreads &= ~((unsigned long long)1<<inThreadId);
       sLazyThreads = sRunningThreads != sAllThreads;
 
       if (!sRunningThreads)
@@ -2093,7 +2081,7 @@ struct GlobalChunks
          {
             for(int spinCount = 0; spinCount<10000; spinCount++)
             {
-               if ( sgThreadPoolAbort || sAllThreads == (1<<inThreadId) )
+               if ( sgThreadPoolAbort || sAllThreads == ((unsigned long long)1<<inThreadId) )
                   break;
                if (processList)
                {
@@ -4858,9 +4846,9 @@ public:
    void finishThreadJob(int inId)
    {
       ThreadPoolAutoLock l(sThreadPoolLock);
-      if (sRunningThreads & (1<<inId))
+      if (sRunningThreads & ((unsigned long long)1<<inId))
       {
-         sRunningThreads &= ~(1<<inId);
+         sRunningThreads &= ~((unsigned long long)1<<inId);
          sLazyThreads = sRunningThreads != sAllThreads;
 
          if (!sRunningThreads)
@@ -4883,16 +4871,15 @@ public:
          // May be woken multiple times if sRunningThreads is set to 0 then 1 before we sleep
          sThreadSleeping[inId] = true;
          // Spurious wake?
-         while( !(sRunningThreads & (1<<inId) ) )
+         while( !(sRunningThreads & ((unsigned long long)1<<inId) ) )
             WaitThreadLocked(sThreadWake[inId]);
          sThreadSleeping[inId] = false;
       }
       #else
-      while( !(sRunningThreads & (1<<inId) ) )
+      while( !(sRunningThreads & ((unsigned long long)1<<inId) ) )
          sThreadWake[inId].Wait();
       #endif
    }
-
 
    void ThreadLoop(int inId)
    {
@@ -4903,7 +4890,7 @@ public:
          waitForThreadWake(inId);
 
          #ifdef HXCPP_GC_VERIFY
-         if (! (sRunningThreads & (1<<inId)) )
+         if (! (sRunningThreads & ((unsigned long long)1<<inId)) )
             printf("Bad running threads!\n");
          #endif
 
@@ -5035,9 +5022,9 @@ public:
 
       int start = std::min(inWorkers, sgThreadCount );
 
-      sAllThreads = (1<<sgThreadCount) - 1;
+      sAllThreads = (sgThreadCount >= 64) ? (unsigned long long)-1 : (((unsigned long long)1<<sgThreadCount) - 1);
 
-      sRunningThreads = (1<<start) - 1;
+      sRunningThreads = (start >= 64) ? (unsigned long long)-1 : (((unsigned long long)1<<start) - 1);
 
       sLazyThreads = sRunningThreads != sAllThreads;
 
@@ -5063,7 +5050,7 @@ public:
 
          if (sRunningThreads)
          {
-            printf("Bad thread stop %d\n", sRunningThreads);
+            printf("Bad thread stop %llu\n", sRunningThreads);
             DebuggerTrap();
          }
       }
@@ -5860,39 +5847,43 @@ public:
              }
 
              volatile int r = 0;
-             while(r < n)
-             {
-                #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-                __try {
-                   for(; r<n; r++) {
-                       hx::Object *obj = ref[r];
-                       if (obj && !((size_t)obj & 3) && IsValidPointer(obj)) {
-                           unsigned int *header = (unsigned int *)obj - 1;
-                           if (*header & 0xffff)
-                               obj->__Mark(marker);
-                       }
-                   }
-                } __except(1) { r++; }
-                #elif !defined(HXCPP_WINRT)
-                ScopedSafeMark safeMark;
-                if (safeMark.SetJmp()) {
-                   for(; r<n; r++) {
-                       hx::Object *obj = ref[r];
-                       if (obj && !((size_t)obj & 3) && IsValidPointer(obj)) {
-                           unsigned int *header = (unsigned int *)obj - 1;
-                           if (*header & 0xffff)
-                               obj->__Mark(marker);
-                       }
-                   }
-                } else { r++; }
-                #else
+             #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+             __try {
                 for(; r<n; r++) {
                     hx::Object *obj = ref[r];
-                    if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
-                        obj->__Mark(marker);
+                    // Optimized check: Direct address range check + alignment
+                    if (obj && !((size_t)obj & 3) && IsValidPointer(obj)) {
+                        // ALWAYS probe memory in release builds too if stability is paramount
+                        // This prevents hard crashes inside virtual calls which SEH might not catch cleanly in all contexts
+                        unsigned int *header = (unsigned int *)obj - 1;
+                        if (ProbeReadSafe(header) && (*header & 0xffff)) {
+                             obj->__Mark(marker);
+                        }
+                    }
                 }
-                #endif
+             } __except(1) {
+                 r++;
              }
+             #elif !defined(HXCPP_WINRT)
+             ScopedSafeMark safeMark;
+             if (safeMark.SetJmp()) {
+                for(; r<n; r++) {
+                    hx::Object *obj = ref[r];
+                    if (obj && !((size_t)obj & 3) && IsValidPointer(obj)) {
+                        unsigned int *header = (unsigned int *)obj - 1;
+                        if (ProbeReadSafe(header) && (*header & 0xffff)) {
+                             obj->__Mark(marker);
+                        }
+                    }
+                }
+             } else { r++; }
+             #else
+             for(; r<n; r++) {
+                 hx::Object *obj = ref[r];
+                 if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+                     obj->__Mark(marker);
+             }
+             #endif
           }
       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
       }
@@ -5919,15 +5910,15 @@ public:
                   // Basic pointer validation
                   if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
                   {
-                      // Check header first to avoid virtual call on bad memory
+                      // Force probe read in all builds to prevent crashes
                       unsigned int *header = (unsigned int *)obj - 1;
-                      if (*header & 0xffff) // Will crash here if invalid, caught by __except
+                      if (ProbeReadSafe(header) && (*header & 0xffff)) {
                           MarkRememberedObjectTry(obj, __inCtx);
+                      }
                   }
                }
            } __except(1) {
-               // GCLOG("MarkRememberedSet: Crashed on object %d %p - skipping\n", i, (*inSet)[i]);
-               i++; // Skip the bad object and retry
+               i++; 
            }
            #elif !defined(HXCPP_WINRT)
            ScopedSafeMark safeMark;
@@ -5938,13 +5929,13 @@ public:
                   if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
                   {
                       unsigned int *header = (unsigned int *)obj - 1;
-                      if (*header & 0xffff) // Will signal here if invalid
+                      if (ProbeReadSafe(header) && (*header & 0xffff)) {
                           MarkRememberedObjectTry(obj, __inCtx);
+                      }
                   }
                }
            } else {
-               // GCLOG("MarkRememberedSet: Signal on object %d %p - skipping\n", i, (*inSet)[i]);
-               i++; // Skip the bad object and retry
+               i++; 
            }
            #else
            // Fallback for platforms without safe handling
