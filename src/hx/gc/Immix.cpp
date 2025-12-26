@@ -5873,13 +5873,16 @@ public:
                    __except(1) {
                    }
                    #else
-                   try {
+                   // On POSIX, use ScopedSafeMark to catch SIGSEGV
+                   ScopedSafeMark safeMark;
+                   if (safeMark.SetJmp()) {
                       // VTable check: if vptr is null or low address, it's invalid
+                      if (!ProbeReadSafe(obj)) continue;
                       void **vptr = (void **)obj;
                       if (!*vptr || (size_t)(*vptr) < 0x10000) continue;
 
                       obj->__Mark(marker);
-                   } catch(...) {}
+                   }
                    #endif
                 }
              }
@@ -5896,24 +5899,37 @@ public:
    {
        if (!inSet) return;
 
-       #if !defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-       ScopedSafeMark outerSafeMark;
-       if (!outerSafeMark.SetJmp()) return;
-       #endif
-
-       HX_SEH_TRY {
-           for(int i=0;i<inSet->size();i++)
-           {
-              hx::Object *obj = (*inSet)[i];
-              // Bypass MarkObjectAlloc check because these are Old objects that we MUST scan
-              if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
-              {
-                 MarkRememberedObjectTry(obj, __inCtx);
+       for(int i=0;i<inSet->size();i++)
+       {
+          hx::Object *obj = (*inSet)[i];
+          // Basic pointer validation
+          if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+          {
+              #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+              __try {
+                 // Additional safety: Probe header before virtual call
+                 unsigned int *header = (unsigned int *)obj - 1;
+                 if (ProbeReadSafe(header)) {
+                     MarkRememberedObjectTry(obj, __inCtx);
+                 }
+              } __except(1) {
+                 #ifdef SHOW_MEM_EVENTS
+                 GCLOG("MarkRememberedSet: Skipping bad object %p\n", obj);
+                 #endif
               }
-           }
-       }
-       HX_SEH_CATCH_ALL {
-           GCLOG("Warning: SEH Exception during MarkRememberedSet\n");
+              #elif !defined(HXCPP_WINRT)
+              // On POSIX, isolate each object mark to prevent one bad apple from spoiling the bunch
+              ScopedSafeMark safeMark;
+              if (safeMark.SetJmp()) {
+                 unsigned int *header = (unsigned int *)obj - 1;
+                 if (ProbeReadSafe(header)) {
+                     MarkRememberedObjectTry(obj, __inCtx);
+                 }
+              }
+              #else
+              MarkRememberedObjectTry(obj, __inCtx);
+              #endif
+          }
        }
    }
 
@@ -8740,7 +8756,11 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
           // Verify header integrity (valid MarkID)
           unsigned int *header = (unsigned int *)obj - 1;
           if (!ProbeReadSafe(header)) return 0;
-          if ((*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID && (*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkIDWithContainer) return 0;
+          
+          // Only check MarkID, don't force it to be current GC MarkID as it might be an old object in incremental GC
+          // Just check if it looks like a valid header structure (size reasonable, etc)
+          unsigned int flags = *header;
+          if ((flags & 0xffff) == 0) return 0; // Size 0 is invalid
           
           return __hxcpp_obj_id(inObj);
        }
@@ -8755,7 +8775,9 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
        
        unsigned int *header = (unsigned int *)obj - 1;
        if (!ProbeReadSafe(header)) return 0;
-       if ((*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID && (*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkIDWithContainer) return 0;
+       
+       unsigned int flags = *header;
+       if ((flags & 0xffff) == 0) return 0;
 
        return __hxcpp_obj_id(inObj);
        #else
@@ -8787,7 +8809,9 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
        // Verify header integrity (valid MarkID)
        unsigned int *header = (unsigned int *)obj - 1;
        if (!ProbeReadSafe(header)) return 0;
-       if ((*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID && (*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkIDWithContainer) return 0;
+       
+       unsigned int flags = *header;
+       if ((flags & 0xffff) == 0) return 0;
    }
    __except(1) { return 0; }
    #elif !defined(HXCPP_WINRT)
@@ -8797,7 +8821,9 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
    
    unsigned int *header = (unsigned int *)obj - 1;
    if (!ProbeReadSafe(header)) return 0;
-   if ((*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID && (*header & IMMIX_ALLOC_MARK_ID) != hx::gMarkIDWithContainer) return 0;
+   
+   unsigned int flags = *header;
+   if ((flags & 0xffff) == 0) return 0;
    #else
    if (!ProbeReadSafe(obj)) return 0;
    #endif
