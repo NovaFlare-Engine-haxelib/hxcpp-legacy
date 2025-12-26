@@ -5859,32 +5859,39 @@ public:
                  return;
              }
 
-             for(int r=0;r<n;r++)
+             volatile int r = 0;
+             while(r < n)
              {
-                hx::Object *obj = ref[r];
-                // Fast path: valid pointer and not tagged
-                if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
-                {
-                   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-                   __try {
-                      // VTable check: if vptr is null or low address, it's invalid
-                      SafeCheckAndMarkTry(obj, marker);
+                #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+                __try {
+                   for(; r<n; r++) {
+                       hx::Object *obj = ref[r];
+                       if (obj && !((size_t)obj & 3) && IsValidPointer(obj)) {
+                           unsigned int *header = (unsigned int *)obj - 1;
+                           if (*header & 0xffff)
+                               obj->__Mark(marker);
+                       }
                    }
-                   __except(1) {
+                } __except(1) { r++; }
+                #elif !defined(HXCPP_WINRT)
+                ScopedSafeMark safeMark;
+                if (safeMark.SetJmp()) {
+                   for(; r<n; r++) {
+                       hx::Object *obj = ref[r];
+                       if (obj && !((size_t)obj & 3) && IsValidPointer(obj)) {
+                           unsigned int *header = (unsigned int *)obj - 1;
+                           if (*header & 0xffff)
+                               obj->__Mark(marker);
+                       }
                    }
-                   #else
-                   // On POSIX, use ScopedSafeMark to catch SIGSEGV
-                   ScopedSafeMark safeMark;
-                   if (safeMark.SetJmp()) {
-                      // VTable check: if vptr is null or low address, it's invalid
-                      if (!ProbeReadSafe(obj)) continue;
-                      void **vptr = (void **)obj;
-                      if (!*vptr || (size_t)(*vptr) < 0x10000) continue;
-
-                      obj->__Mark(marker);
-                   }
-                   #endif
+                } else { r++; }
+                #else
+                for(; r<n; r++) {
+                    hx::Object *obj = ref[r];
+                    if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+                        obj->__Mark(marker);
                 }
+                #endif
              }
           }
       #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
@@ -5899,37 +5906,55 @@ public:
    {
        if (!inSet) return;
 
-       for(int i=0;i<inSet->size();i++)
+       volatile int i = 0;
+       int size = inSet->size();
+
+       while(i < size)
        {
-          hx::Object *obj = (*inSet)[i];
-          // Basic pointer validation
-          if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
-          {
-              #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-              __try {
-                 // Additional safety: Probe header before virtual call
-                 unsigned int *header = (unsigned int *)obj - 1;
-                 if (ProbeReadSafe(header)) {
-                     MarkRememberedObjectTry(obj, __inCtx);
-                 }
-              } __except(1) {
-                 #ifdef SHOW_MEM_EVENTS
-                 GCLOG("MarkRememberedSet: Skipping bad object %p\n", obj);
-                 #endif
-              }
-              #elif !defined(HXCPP_WINRT)
-              // On POSIX, isolate each object mark to prevent one bad apple from spoiling the bunch
-              ScopedSafeMark safeMark;
-              if (safeMark.SetJmp()) {
-                 unsigned int *header = (unsigned int *)obj - 1;
-                 if (ProbeReadSafe(header)) {
-                     MarkRememberedObjectTry(obj, __inCtx);
-                 }
-              }
-              #else
-              MarkRememberedObjectTry(obj, __inCtx);
-              #endif
-          }
+           #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
+           __try {
+               for(; i < size; i++)
+               {
+                  hx::Object *obj = (*inSet)[i];
+                  // Basic pointer validation
+                  if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+                  {
+                      // Check header first to avoid virtual call on bad memory
+                      unsigned int *header = (unsigned int *)obj - 1;
+                      if (*header & 0xffff) // Will crash here if invalid, caught by __except
+                          MarkRememberedObjectTry(obj, __inCtx);
+                  }
+               }
+           } __except(1) {
+               // GCLOG("MarkRememberedSet: Crashed on object %d %p - skipping\n", i, (*inSet)[i]);
+               i++; // Skip the bad object and retry
+           }
+           #elif !defined(HXCPP_WINRT)
+           ScopedSafeMark safeMark;
+           if (safeMark.SetJmp()) {
+               for(; i < size; i++)
+               {
+                  hx::Object *obj = (*inSet)[i];
+                  if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+                  {
+                      unsigned int *header = (unsigned int *)obj - 1;
+                      if (*header & 0xffff) // Will signal here if invalid
+                          MarkRememberedObjectTry(obj, __inCtx);
+                  }
+               }
+           } else {
+               // GCLOG("MarkRememberedSet: Signal on object %d %p - skipping\n", i, (*inSet)[i]);
+               i++; // Skip the bad object and retry
+           }
+           #else
+           // Fallback for platforms without safe handling
+           for(; i < size; i++)
+           {
+              hx::Object *obj = (*inSet)[i];
+              if (obj && !((size_t)obj & 3) && IsValidPointer(obj))
+                  MarkRememberedObjectTry(obj, __inCtx);
+           }
+           #endif
        }
    }
 
@@ -7990,7 +8015,7 @@ void InitAlloc() //inits
       int bd = ReadEnvInt("HX_GC_MINOR_BASE_DELTA_BYTES", 5 * 1024 * 1024);
       int gm = ReadEnvInt("HX_GC_MINOR_GATE_MS", 500);
       int sb = ReadEnvInt("HX_GC_MINOR_START_BYTES", 8*1024*1024);
-      int lr = ReadEnvBool("HX_GC_LARGE_REFRESH", 0);
+      int lr = ReadEnvBool("HX_GC_LARGE_REFRESH", 1);
       hx::GCConfig cfg = hx::GetGCConfig();
       cfg.parallelGcThreads = pg;
       cfg.concRefinementThreads = rt;
