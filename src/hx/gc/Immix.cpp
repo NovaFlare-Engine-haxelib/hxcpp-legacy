@@ -3664,7 +3664,24 @@ public:
          #endif
 
          bool forceCompact = false;
-         if (!result && allowMoreBlocks() && (!sgInternalEnable || GetWorkingMemory()<sWorkingMemorySize))
+         
+         // OVER-ALLOCATION LOGIC:
+         // If concurrent GC is active (gConcurrentState != gcStateNone), we allow the heap to grow
+         // BEYOND sWorkingMemorySize.
+         // This prevents the allocator from hitting the limit and triggering a synchronous STW GC
+         // while the background thread is already working on freeing memory.
+         // We essentially "borrow" memory from the OS to survive the high-allocation burst.
+         bool allowGrowth = !sgInternalEnable || GetWorkingMemory()<sWorkingMemorySize;
+         
+         #ifdef HXCPP_GC_CONCURRENT
+         if (!allowGrowth && gConcurrentState != gcStateNone)
+         {
+             // Concurrent GC is running, let's allow growth to avoid STW!
+             allowGrowth = true;
+         }
+         #endif
+
+         if (!result && allowMoreBlocks() && allowGrowth)
          {
             if (AllocMoreBlocks(forceCompact,false))
                result = GetNextFree(inRequiredBytes);

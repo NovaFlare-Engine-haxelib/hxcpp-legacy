@@ -29,7 +29,7 @@ namespace hx
 int sgMinimumWorkingMemory       = 384*1024*1024;
 int sgMinimumFreeSpace           = 64*1024*1024;
 // Once you use more than the minimum, this kicks in...
-int sgTargetFreeSpacePercentage  = 95;
+int sgTargetFreeSpacePercentage  = 100;
 
 
 
