@@ -29,6 +29,10 @@ namespace hx
    int gByteMarkID = 0x10;
    int gRememberedByteMarkID = 0x10 | HX_GC_REMEMBERED;
 
+   #ifdef HXCPP_GC_CONCURRENT
+   bool gConcurrentMarkingActive = false;
+   #endif
+
 
 int gFastPath = 0;
 int gSlowPath = 0;
@@ -4939,20 +4943,36 @@ public:
 
       #ifdef HXCPP_GC_GENERATIONAL
       bool compactSurviors = false;
+      #endif
 
-      if (sGcMode==gcmGenerational)
+      for(int i=0;i<mLocalAllocs.size();i++)
       {
-         for(int i=0;i<mLocalAllocs.size();i++)
+         hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
+
+         #ifdef HXCPP_GC_GENERATIONAL
+         if (sGcMode==gcmGenerational)
          {
-            hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
-            if( ctx->mOldReferrers->count )
+            if( ctx->mOldReferrers && ctx->mOldReferrers->count )
                 hx::sGlobalChunks.addLocked( ctx->mOldReferrers );
-            else
+            else if (ctx->mOldReferrers)
                 hx::sGlobalChunks.free( ctx->mOldReferrers );
             ctx->mOldReferrers = 0;
          }
+         #endif
+
+         #ifdef HXCPP_GC_CONCURRENT
+         if( ctx->mSATBBuffer )
+         {
+             if (ctx->mSATBBuffer->count)
+                hx::sGlobalChunks.addLocked( ctx->mSATBBuffer );
+             else
+                hx::sGlobalChunks.free( ctx->mSATBBuffer );
+             ctx->mSATBBuffer = 0;
+         }
+         #endif
       }
 
+      #ifdef HXCPP_GC_GENERATIONAL
       hx::QuickVec<hx::Object *> rememberedSet;
       generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
       if (sGcMode==gcmGenerational)
@@ -7003,12 +7023,7 @@ int   __hxcpp_gc_reserved_bytes()
 static size_t __hxcpp_process_used_bytes()
 {
    #ifdef HX_WINDOWS
-   static int s_winMemMode = -1; // -1=init, 0=WorkingSetSize, 1=PrivateUsage
-   if (s_winMemMode<0)
-   {
-      // 0 -> WorkingSet (Task Manager "Working Set"), 1 -> PrivateUsage (closer to TM "Memory" on newer Windows)
-      s_winMemMode = ReadEnvInt("HX_GC_WIN_PROCESS_MEM_MODE", 0);
-   }
+   static int s_winMemMode = 0; // -1=init, 0=WorkingSetSize, 1=PrivateUsage
 
    PROCESS_MEMORY_COUNTERS pmc;
    SIZE_T sz = sizeof(pmc);

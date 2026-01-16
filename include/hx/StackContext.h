@@ -445,6 +445,19 @@ struct StackContext : public hx::ImmixAllocator
    }
    #endif
 
+   #ifdef HXCPP_GC_CONCURRENT
+   MarkChunk *mSATBBuffer;
+   inline void pushSATB(hx::Object *inOldValue)
+   {
+      if (mSATBBuffer && inOldValue)
+      {
+         mSATBBuffer->push(inOldValue);
+         if (mSATBBuffer->count == MarkChunk::SIZE)
+            mSATBBuffer = mSATBBuffer->swapForNew();
+      }
+   }
+   #endif
+
    #ifdef HXCPP_CATCH_SEGV
       #ifdef _MSC_VER
       _se_translator_function mOldSignalFunc;

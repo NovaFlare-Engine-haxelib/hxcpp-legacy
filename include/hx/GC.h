@@ -451,6 +451,21 @@ typedef ImmixAllocator GcAllocator;
 typedef ImmixAllocator Ctx;
 
 
+#ifdef HXCPP_GC_CONCURRENT
+   // Concurrent marking active?
+   HXCPP_EXTERN_CLASS_ATTRIBUTES extern bool gConcurrentMarkingActive;
+
+   #define HX_OBJ_WB_SATB_CTX(obj, old_val, ctx) { \
+       if (hx::gConcurrentMarkingActive && old_val) { \
+           ctx->pushSATB(old_val); \
+       } \
+   }
+#else
+   #define HX_OBJ_WB_SATB_CTX(obj, old_val, ctx)
+#endif
+
+#define HX_OBJ_WB_SATB(obj, old_val) HX_OBJ_WB_SATB_CTX(obj, old_val, _hx_ctx)
+
 #ifdef HXCPP_GC_GENERATIONAL
   #define HX_OBJ_WB_CTX(obj,value,ctx) { \
         unsigned char &mark =  ((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
