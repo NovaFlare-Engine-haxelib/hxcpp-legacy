@@ -75,26 +75,9 @@ void Anon_obj::__Mark(hx::MarkContext *__inCtx)
 {
    if (mFixedFields)
    {
-      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-      __try {
-         VariantKey *fixed = getFixed();
-         // Verify fixed array is valid before accessing
-         if (fixed && (size_t)fixed > 0x10000) {
-             for(int i=0;i<mFixedFields;i++)
-                HX_MARK_MEMBER(fixed[i].value);
-         }
-      }
-      __except(1) {
-          // Safe ignore bad anon
-      }
-      #else
       VariantKey *fixed = getFixed();
-      // Basic validity check for non-windows
-      if (fixed && !((size_t)fixed & 3)) {
-         for(int i=0;i<mFixedFields;i++)
-            HX_MARK_MEMBER(fixed[i].value);
-      }
-      #endif
+      for(int i=0;i<mFixedFields;i++)
+         HX_MARK_MEMBER(fixed[i].value);
    }
    HX_MARK_MEMBER(mFields);
 }
@@ -116,15 +99,7 @@ inline int Anon_obj::findFixed(const ::String &inKey, bool inSkip5)
 {
    if (!mFixedFields || !inKey.isAsciiEncoded() )
       return -1;
-      
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   __try {
-   #endif
-   
    VariantKey *fixed = getFixed();
-   
-   // Safety check
-   if (!fixed || ((size_t)fixed & 3)) return -1;
 
    if (!inSkip5)
       if (inKey.__s[HX_GC_CONST_ALLOC_MARK_OFFSET]  & HX_GC_CONST_ALLOC_MARK_BIT)
@@ -189,10 +164,6 @@ inline int Anon_obj::findFixed(const ::String &inKey, bool inSkip5)
       if (min>=mFixedFields)
          break;
    }
-   
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   } __except(1) { return -1; }
-   #endif
 
    return -1;
 }
@@ -206,10 +177,6 @@ hx::Val Anon_obj::__Field(const String &inName, hx::PropertyAccess inCallProp)
    if (mFixedFields>0)
    {
       VariantKey *fixed = getFixed();
-      
-      // Safety check for fixed array
-      if (!fixed || ((size_t)fixed & 3)) return hx::Val();
-
       if (inName.__s[HX_GC_CONST_ALLOC_MARK_OFFSET]  & HX_GC_CONST_ALLOC_MARK_BIT)
       {
          for(int i=0;i<mFixedFields;i++)
@@ -273,30 +240,13 @@ bool Anon_obj::__Remove(String inKey)
    int slot = findFixed(inKey);
    if (slot>=0)
    {
-      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-      __try {
-      #endif
-      
       VariantKey *fixed = getFixed();
-      
-      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-      if (fixed && (size_t)fixed >= 0x10000)
-      #else
-      if (fixed && !((size_t)fixed & 3))
-      #endif
+      while(slot<mFixedFields)
       {
-         while(slot<mFixedFields)
-         {
-            fixed[slot] = fixed[slot+1];
-            slot++;
-         }
-         mFixedFields--;
+         fixed[slot] = fixed[slot+1];
+         slot++;
       }
-      
-      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-      } __except(1) { return false; }
-      #endif
-      
+      mFixedFields--;
       return true;
    }
 
@@ -311,36 +261,13 @@ hx::Val Anon_obj::__SetField(const String &inName,const hx::Val &inValue, hx::Pr
    int slot = findFixed(inName);
    if (slot>=0)
    {
-      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-      __try {
-      #endif
-      
       #ifdef HXCPP_GC_GENERATIONAL
       VariantKey *fixed = getFixed() + slot;
-      
-      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-      if (!fixed || (size_t)fixed < 0x10000) return inValue;
-      #else
-      if (!fixed || ((size_t)fixed & 3)) return inValue;
-      #endif
-      
       fixed->value=inValue;
       if (fixed->value.type <= cpp::Variant::typeString)
          HX_OBJ_WB_GET(this, fixed->value.valObject);
       #else
-      VariantKey *fixed = getFixed();
-      
-      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-      if (!fixed || (size_t)fixed < 0x10000) return inValue;
-      #else
-      if (!fixed || ((size_t)fixed & 3)) return inValue;
-      #endif
-      
-      fixed[slot].value=inValue;
-      #endif
-      
-      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-      } __except(1) { }
+      getFixed()[slot].value=inValue;
       #endif
       return inValue;
    }
@@ -447,22 +374,9 @@ void Anon_obj::__GetFields(Array<String> &outFields)
       outFields = __string_hash_keys(mFields);
    if (mFixedFields>0)
    {
-      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-      __try {
-         VariantKey *fixed = getFixed();
-         if (fixed && (size_t)fixed > 0x10000) {
-            for(int i=0;i<mFixedFields;i++)
-               outFields->push( fixed[i].key );
-         }
-      }
-      __except(1) { }
-      #else
       VariantKey *fixed = getFixed();
-      if (fixed && !((size_t)fixed & 3)) {
-         for(int i=0;i<mFixedFields;i++)
-            outFields->push( fixed[i].key );
-      }
-      #endif
+      for(int i=0;i<mFixedFields;i++)
+         outFields->push( fixed[i].key );
    }
 }
 

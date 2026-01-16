@@ -383,45 +383,6 @@ namespace cpp
 #include "cpp/VirtualArray.h"
 
 
-// --- ArraySafeReader -----------------------------------------------------------
-namespace hx {
-
-template<typename T>
-struct ArraySafeReader {
-    static inline T get(const char *base, int index) {
-        return * (T *)(base + index*sizeof(T));
-    }
-};
-
-#if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-template<> struct ArraySafeReader<float> {
-    static inline float get(const char *base, int index) {
-        __try { return * (float *)(base + index*sizeof(float)); } __except(1) { return 0.0f; }
-    }
-};
-template<> struct ArraySafeReader<double> {
-    static inline double get(const char *base, int index) {
-        __try { return * (double *)(base + index*sizeof(double)); } __except(1) { return 0.0; }
-    }
-};
-template<> struct ArraySafeReader<int> {
-    static inline int get(const char *base, int index) {
-        __try { return * (int *)(base + index*sizeof(int)); } __except(1) { return 0; }
-    }
-};
-template<> struct ArraySafeReader<unsigned char> {
-    static inline unsigned char get(const char *base, int index) {
-        __try { return * (unsigned char *)(base + index*sizeof(unsigned char)); } __except(1) { return 0; }
-    }
-};
-template<> struct ArraySafeReader<bool> {
-    static inline bool get(const char *base, int index) {
-        __try { return * (bool *)(base + index*sizeof(bool)); } __except(1) { return false; }
-    }
-};
-#endif
-
-}
 
 
 // --- Array_obj ------------------------------------------------------------------
@@ -539,7 +500,7 @@ public:
    inline ELEM_ __get(int inIndex) const
    {
       if ((unsigned int)inIndex>=(unsigned int)length ) return null();
-      return hx::ArraySafeReader<ELEM_>::get(mBase, inIndex);
+      return * (ELEM_ *)(mBase + inIndex*sizeof(ELEM_));
    }
 
    // Does not check for size valid - use with care
@@ -582,34 +543,12 @@ public:
 
    void __Mark(hx::MarkContext *__inCtx)
    {
-      #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-      __try {
-         if (mAlloc>0) {
-            // Validate mBase before marking
-            if (mBase && !((size_t)mBase & 3))
-               hx::MarkAlloc((void *)mBase, __inCtx );
-         }
-         if (length && hx::ContainsPointers<ELEM_>())
-         {
-            ELEM_ *ptr = (ELEM_ *)mBase;
-            // Validate pointer before array mark
-            if (ptr && !((size_t)ptr & 3))
-               HX_MARK_MEMBER_ARRAY(ptr,length);
-         }
-      }
-      __except(1) { }
-      #else
-      if (mAlloc>0) {
-         if (mBase && !((size_t)mBase & 3))
-            hx::MarkAlloc((void *)mBase, __inCtx );
-      }
+      if (mAlloc>0) hx::MarkAlloc((void *)mBase, __inCtx );
       if (length && hx::ContainsPointers<ELEM_>())
       {
          ELEM_ *ptr = (ELEM_ *)mBase;
-         if (ptr && !((size_t)ptr & 3))
-            HX_MARK_MEMBER_ARRAY(ptr,length);
+         HX_MARK_MEMBER_ARRAY(ptr,length);
       }
-      #endif
    }
 
    #ifdef HXCPP_VISIT_ALLOCS

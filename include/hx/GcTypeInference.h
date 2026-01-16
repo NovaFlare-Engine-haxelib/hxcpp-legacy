@@ -82,7 +82,6 @@ template<typename T> inline void MarkMemberArray(Array<T> *outT,int inLen,hx::Ma
 
 // Locate potential GC pointer inside member
 inline const void *PointerOf( ::Dynamic &d) { return d.mPtr; }
-inline const void *PointerOf( const ::Dynamic &d) { return d.mPtr; }
 inline const void *PointerOf( ::String &s) { return s.raw_ptr(); }
 template<typename T> inline const void *PointerOf( ::Array<T> &a) { return a.mPtr; }
 template<typename T> inline const void *PointerOf( ::hx::ObjectPtr<T> &o) { return o.mPtr; }

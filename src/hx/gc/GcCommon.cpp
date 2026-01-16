@@ -27,15 +27,14 @@ extern void __hxt_new_string(void* result, int size);
 namespace hx
 {
 #if defined(HX_MACOS) || defined(HX_WINDOWS) || defined(HX_LINUX) || defined(__ORBIS__)
-int sgMinimumWorkingMemory       = 384*1024*1024;
+int sgMinimumWorkingMemory       = 128*1024*1024;
 int sgMinimumFreeSpace           = 64*1024*1024;
 #else
-int sgMinimumWorkingMemory       = 384*1024*1024;
+int sgMinimumWorkingMemory       = 128*1024*1024;
 int sgMinimumFreeSpace           = 64*1024*1024;
 #endif
-
 // Once you use more than the minimum, this kicks in...
-int sgTargetFreeSpacePercentage  = 90;
+int sgTargetFreeSpacePercentage  = 100;
 
 
 
@@ -156,15 +155,6 @@ void __hxcpp_enable(bool inEnable)
    hx::InternalEnableGC(inEnable);
 }
 
-void __hxcpp_gc_minor()
-{
-   extern int sStrictMinorRequested;
-   extern double sMinorLastCollect;
-   sStrictMinorRequested = 0;
-   __hxcpp_collect(false);
-   sMinorLastCollect = __hxcpp_time_stamp();
-}
-
 void  __hxcpp_set_minimum_working_memory(int inBytes)
 {
    hx::sgMinimumWorkingMemory = inBytes;
@@ -189,3 +179,4 @@ bool __hxcpp_is_const_string(const ::String &inString)
    #endif
    return ((unsigned int *)inString.raw_ptr())[-1] & HX_GC_CONST_ALLOC_BIT;
 }
+

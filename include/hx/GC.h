@@ -38,41 +38,9 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_enter_gc_free_zone();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_exit_gc_free_zone();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_safe_point();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_spam_collects(int inEveryNCalls);
-
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_minor();
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_update();
-
-HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_get_minor_base_delta_bytes();
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minor_base_delta_bytes(int inBytes);
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minor_gate_ms(int inMs);
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minor_start_bytes(int inBytes);
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_large_refresh_enable(int inEnable);
-HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_get_minor_gate_ms();
-HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_get_minor_start_bytes();
-HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_gc_get_large_refresh_enabled();
-HXCPP_EXTERN_CLASS_ATTRIBUTES size_t __hxcpp_gc_get_working_memory_size();
-HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_gc_get_target_free_space_percentage();
-HXCPP_EXTERN_CLASS_ATTRIBUTES size_t __hxcpp_gc_garbage_estimate();
-HXCPP_EXTERN_CLASS_ATTRIBUTES size_t __hxcpp_gc_get_last_garbage_estimate();
-
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_enable_log(bool enable);
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_set_callback(Dynamic inFunc);
-
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_set_threads(int parallelThreads, int refineThreads);
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_set_max_pause_ms(int inMs);
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_aggressive_safepoint(int inEnable);
-HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_enable_parallel_ref_proc(int inEnable);
-HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_gc_get_parallel_threads();
-HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_gc_get_refine_threads();
-HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_gc_get_max_pause_ms();
-HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_gc_get_aggressive_safepoint();
-HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_gc_get_parallel_ref_proc_enabled();
-
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_working_memory(int inBytes);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_free_space(int inBytes);
-
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_target_free_space_percentage(int inPercentage);
-
 HXCPP_EXTERN_CLASS_ATTRIBUTES bool __hxcpp_is_const_string(const ::String &inString);
 HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_gc_freeze(Dynamic inObject);
 
@@ -94,6 +62,8 @@ inline void _hx_add_finalizable( T *inObj, bool inPin)
   _hx_member_finalizer finalizer = (_hx_member_finalizer)&T::finalize;
   __hxcpp_add_member_finalizer(inObj, finalizer, inPin);
 }
+
+
 
 template<typename T>
 T _hx_allocate_extended(int inExtra)
@@ -484,7 +454,7 @@ typedef ImmixAllocator Ctx;
 #ifdef HXCPP_GC_GENERATIONAL
   #define HX_OBJ_WB_CTX(obj,value,ctx) { \
         unsigned char &mark =  ((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
-        if (mark == hx::gByteMarkID && value) { \
+        if (mark == hx::gByteMarkID && value && !((unsigned char *)(value))[ HX_ENDIAN_MARK_ID_BYTE  ] ) { \
             mark|=HX_GC_REMEMBERED; \
             ctx->pushReferrer(obj); \
      } }
@@ -618,3 +588,4 @@ inline void MarkObjectAlloc(hx::Object *inPtr ,hx::MarkContext *__inCtx)
 
 
 #endif
+

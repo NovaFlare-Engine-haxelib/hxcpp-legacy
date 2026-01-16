@@ -577,14 +577,8 @@ typedef hx::Hash< TStringElement<cpp::Int64> >  StringHashInt64;
 }
 
 
-void __string_hash_set_safe(HX_MAP_THIS_ARG,String inKey,const Dynamic &value, bool inForceDynamic)
+void __string_hash_set(HX_MAP_THIS_ARG,String inKey,const Dynamic &value, bool inForceDynamic)
 {
-   if (!ioHash.mPtr && !value.mPtr)
-   {
-       // If both hash and value are null/empty, we might be initializing
-       // But if ioHash.mPtr is null, GetPtr() is safe (returns null)
-   }
-
    StringHashBase *hash = static_cast<StringHashBase *>(ioHash.GetPtr());
    if (!hash)
    {
@@ -607,74 +601,50 @@ void __string_hash_set_safe(HX_MAP_THIS_ARG,String inKey,const Dynamic &value, b
       ioHash = hash;
       HX_OBJ_WB_GET(owner,hash);
    }
-   else 
+   else if (hash->store!=hashObject)
    {
-      // Verify hash pointer validity before accessing store
-      #if !defined(HX_WINDOWS)
-      if (((size_t)hash & 3) != 0) return;
-      #endif
-      
-      if (hash->store!=hashObject)
+      HashStore want = hashObject;
+      if (value!=null())
       {
-         HashStore want = hashObject;
-         if (value!=null())
+         hxObjectType type = (hxObjectType)value->__GetType();
+         if (type==vtInt)
          {
-            hxObjectType type = (hxObjectType)value->__GetType();
-            if (type==vtInt)
-            {
-               if (hash->store==hashFloat)
-                  want = hashFloat;
-               else if (hash->store==hashInt)
-                  want = hashInt;
-               else if (hash->store==hashInt64)
-                  want = hashInt64;
-            }
-            else if (type==vtFloat)
-            {
-               if (hash->store==hashInt || hash->store==hashFloat)
-                  want = hashFloat;
-            }
-            else if (type==vtString)
-            {
-               if (hash->store==hashString)
-                  want = hashString;
-            }
-            else if (type==vtInt64)
-            {
-               if (hash->store==hashInt || hash->store==hashInt64)
-                  want = hashInt64;
-            }
+            if (hash->store==hashFloat)
+               want = hashFloat;
+            else if (hash->store==hashInt)
+               want = hashInt;
+            else if (hash->store==hashInt64)
+               want = hashInt64;
          }
-         if (hash->store!=want)
+         else if (type==vtFloat)
          {
-            hash = hash->convertStore(want);
-            ioHash = hash;
-            HX_OBJ_WB_GET(owner,hash);
+            if (hash->store==hashInt || hash->store==hashFloat)
+               want = hashFloat;
          }
+         else if (type==vtString)
+         {
+            if (hash->store==hashString)
+               want = hashString;
+         }
+         else if (type==vtInt64)
+         {
+            if (hash->store==hashInt || hash->store==hashInt64)
+               want = hashInt64;
+         }
+      }
+      if (hash->store!=want)
+      {
+         hash = hash->convertStore(want);
+         ioHash = hash;
+         HX_OBJ_WB_GET(owner,hash);
       }
    }
 
    hash->set(inKey,value);
 }
 
-void __string_hash_set(HX_MAP_THIS_ARG,String inKey,const Dynamic &value, bool inForceDynamic)
+void __string_hash_set_int(HX_MAP_THIS_ARG,String inKey,int inValue)
 {
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   __try {
-      __string_hash_set_safe(owner, ioHash, inKey, value, inForceDynamic);
-   }
-   __except(1) {
-      // GCLOG("Warning: SEH Exception during __string_hash_set\n");
-   }
-   #else
-   __string_hash_set_safe(owner, ioHash, inKey, value, inForceDynamic);
-   #endif
-}
-
-void __string_hash_set_int_safe(HX_MAP_THIS_ARG,String inKey,int inValue)
-{
-   if (!ioHash.mPtr) { /* Init if needed */ }
-
    StringHashBase *hash = static_cast<StringHashBase *>(ioHash.GetPtr());
    if (!hash)
    {
@@ -682,41 +652,19 @@ void __string_hash_set_int_safe(HX_MAP_THIS_ARG,String inKey,int inValue)
       ioHash = hash;
       HX_OBJ_WB_GET(owner,hash);
    }
-   else 
+   else if (hash->store==hashString)
    {
-      // Verify hash pointer validity before accessing store
-      #if !defined(HX_WINDOWS)
-      if (((size_t)hash & 3) != 0) return;
-      #endif
-
-      if (hash->store==hashString)
-      {
-         hash = hash->convertStore(hashObject);
-         ioHash = hash;
-         HX_OBJ_WB_GET(owner,hash);
-      }
+      hash = hash->convertStore(hashObject);
+      ioHash = hash;
+      HX_OBJ_WB_GET(owner,hash);
    }
 
    hash->set(inKey,inValue);
 }
 
-void __string_hash_set_int(HX_MAP_THIS_ARG,String inKey,int inValue)
+
+void __string_hash_set_float(HX_MAP_THIS_ARG,String inKey,Float inValue)
 {
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   __try {
-      __string_hash_set_int_safe(owner, ioHash, inKey, inValue);
-   }
-   __except(1) { }
-   #else
-   __string_hash_set_int_safe(owner, ioHash, inKey, inValue);
-   #endif
-}
-
-
-void __string_hash_set_float_safe(HX_MAP_THIS_ARG,String inKey,Float inValue)
-{
-   if (!ioHash.mPtr) { }
-
    StringHashBase *hash = static_cast<StringHashBase *>(ioHash.GetPtr());
    if (!hash)
    {
@@ -724,48 +672,26 @@ void __string_hash_set_float_safe(HX_MAP_THIS_ARG,String inKey,Float inValue)
       ioHash = hash;
       HX_OBJ_WB_GET(owner,hash);
    }
-   else 
+   else if (hash->store==hashString || hash->store==hashInt64)
    {
-      // Verify hash pointer validity before accessing store
-      #if !defined(HX_WINDOWS)
-      if (((size_t)hash & 3) != 0) return;
-      #endif
-
-      if (hash->store==hashString || hash->store==hashInt64)
-      {
-         hash = hash->convertStore(hashObject);
-         ioHash = hash;
-         HX_OBJ_WB_GET(owner,hash);
-      }
-      else if (hash->store==hashInt)
-      {
-         hash = hash->convertStore(hashFloat);
-         ioHash = hash;
-         HX_OBJ_WB_GET(owner,hash);
-      }
+      hash = hash->convertStore(hashObject);
+      ioHash = hash;
+      HX_OBJ_WB_GET(owner,hash);
+   }
+   else if (hash->store==hashInt)
+   {
+      hash = hash->convertStore(hashFloat);
+      ioHash = hash;
+      HX_OBJ_WB_GET(owner,hash);
    }
 
    hash->set(inKey,inValue);
 }
 
-void __string_hash_set_float(HX_MAP_THIS_ARG,String inKey,Float inValue)
+
+
+void __string_hash_set_string(HX_MAP_THIS_ARG,String inKey, ::String inValue)
 {
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   __try {
-      __string_hash_set_float_safe(owner, ioHash, inKey, inValue);
-   }
-   __except(1) { }
-   #else
-   __string_hash_set_float_safe(owner, ioHash, inKey, inValue);
-   #endif
-}
-
-
-
-void __string_hash_set_string_safe(HX_MAP_THIS_ARG,String inKey, ::String inValue)
-{
-   if (!ioHash.mPtr) { }
-
    StringHashBase *hash = static_cast<StringHashBase *>(ioHash.GetPtr());
    if (!hash)
    {
@@ -773,40 +699,18 @@ void __string_hash_set_string_safe(HX_MAP_THIS_ARG,String inKey, ::String inValu
       ioHash = hash;
       HX_OBJ_WB_GET(owner,hash);
    }
-   else 
+   else if (hash->store==hashInt || hash->store==hashFloat || hash->store==hashInt64)
    {
-      // Verify hash pointer validity before accessing store
-      #if !defined(HX_WINDOWS)
-      if (((size_t)hash & 3) != 0) return;
-      #endif
-
-      if (hash->store==hashInt || hash->store==hashFloat || hash->store==hashInt64)
-      {
-         hash = hash->convertStore(hashObject);
-         ioHash = hash;
-         HX_OBJ_WB_GET(owner,hash);
-      }
+      hash = hash->convertStore(hashObject);
+      ioHash = hash;
+      HX_OBJ_WB_GET(owner,hash);
    }
 
    hash->set(inKey,inValue);
 }
 
-void __string_hash_set_string(HX_MAP_THIS_ARG,String inKey, ::String inValue)
+void __string_hash_set_int64(HX_MAP_THIS_ARG, String inKey, cpp::Int64 inValue)
 {
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   __try {
-      __string_hash_set_string_safe(owner, ioHash, inKey, inValue);
-   }
-   __except(1) { }
-   #else
-   __string_hash_set_string_safe(owner, ioHash, inKey, inValue);
-   #endif
-}
-
-void __string_hash_set_int64_safe(HX_MAP_THIS_ARG, String inKey, cpp::Int64 inValue)
-{
-   if (!ioHash.mPtr) { }
-
    StringHashBase *hash = static_cast<StringHashBase *>(ioHash.GetPtr());
    if (!hash)
    {
@@ -814,46 +718,24 @@ void __string_hash_set_int64_safe(HX_MAP_THIS_ARG, String inKey, cpp::Int64 inVa
       ioHash = hash;
       HX_OBJ_WB_GET(owner,hash);
    }
-   else 
+   else if (hash->store==hashInt)
    {
-      // Verify hash pointer validity before accessing store
-      #if !defined(HX_WINDOWS)
-      if (((size_t)hash & 3) != 0) return;
-      #endif
-
-      if (hash->store==hashInt)
-      {
-         hash = hash->convertStore(hashInt64);
-         ioHash = hash;
-         HX_OBJ_WB_GET(owner,hash);
-      }
-      else if (hash->store==hashString || hash->store==hashFloat)
-      {
-         hash = hash->convertStore(hashObject);
-         ioHash = hash;
-         HX_OBJ_WB_GET(owner,hash);
-      }
+      hash = hash->convertStore(hashInt64);
+      ioHash = hash;
+      HX_OBJ_WB_GET(owner,hash);
+   }
+   else if (hash->store==hashString || hash->store==hashFloat)
+   {
+      hash = hash->convertStore(hashObject);
+      ioHash = hash;
+      HX_OBJ_WB_GET(owner,hash);
    }
 
    hash->set(inKey, inValue);
 }
 
-void __string_hash_set_int64(HX_MAP_THIS_ARG, String inKey, cpp::Int64 inValue)
+::String __string_hash_map_substr(HX_MAP_THIS_ARG,String inKey, int inStart, int inLength)
 {
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   __try {
-      __string_hash_set_int64_safe(owner, ioHash, inKey, inValue);
-   }
-   __except(1) { }
-   #else
-   __string_hash_set_int64_safe(owner, ioHash, inKey, inValue);
-   #endif
-}
-
-::String __string_hash_map_substr_safe(HX_MAP_THIS_ARG,String inKey, int inStart, int inLength)
-{
-   if (!ioHash.mPtr) { }
-
    StringHashBase *sash = static_cast<StringHashBase *>(ioHash.GetPtr());
    if (!sash)
    {
@@ -861,19 +743,11 @@ void __string_hash_set_int64(HX_MAP_THIS_ARG, String inKey, cpp::Int64 inValue)
       ioHash = sash;
       HX_OBJ_WB_GET(owner,sash);
    }
-   else 
+   else if (sash->store!=hashInt)
    {
-      // Verify hash pointer validity before accessing store
-      #if !defined(HX_WINDOWS)
-      if (((size_t)sash & 3) != 0) return String();
-      #endif
-
-      if (sash->store!=hashInt)
-      {
-         sash = sash->convertStore(hashInt);
-         ioHash = sash;
-         HX_OBJ_WB_GET(owner,sash);
-      }
+      sash = sash->convertStore(hashInt);
+      ioHash = sash;
+      HX_OBJ_WB_GET(owner,sash);
    }
 
    StringHashInt *shi = static_cast<StringHashInt *>(sash);
@@ -924,48 +798,16 @@ void __string_hash_set_int64(HX_MAP_THIS_ARG, String inKey, cpp::Int64 inValue)
    return k;
 }
 
-::String __string_hash_map_substr(HX_MAP_THIS_ARG,String inKey, int inStart, int inLength)
-{
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   __try {
-      return __string_hash_map_substr_safe(owner, ioHash, inKey, inStart, inLength);
-   }
-   __except(1) { return String(); }
-   #else
-   return __string_hash_map_substr_safe(owner, ioHash, inKey, inStart, inLength);
-   #endif
-}
-
 
 Dynamic  __string_hash_get(Dynamic inHash,String inKey)
 {
-   if (!inHash.mPtr) return null();
-
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   __try {
-      StringHashBase *hash = static_cast<StringHashBase *>(inHash.GetPtr());
-      if (!hash) return null();
-
-      Dynamic result = null();
-      hash->query(inKey,result);
-      return result;
-   }
-   __except(1) {
-      return null();
-   }
-   #else
-   // Non-Windows platforms: Safe check
    StringHashBase *hash = static_cast<StringHashBase *>(inHash.GetPtr());
    if (!hash)
       return null();
 
-   // Verify pointer alignment and basic validity if possible
-   if (((size_t)hash & 3) != 0) return null();
-   
    Dynamic result = null();
    hash->query(inKey,result);
    return result;
-   #endif
 }
 
 int  __string_hash_get_int(Dynamic inHash,String inKey)
@@ -1015,28 +857,10 @@ cpp::Int64 __string_hash_get_int64(Dynamic inHash,String inKey)
 
 bool  __string_hash_exists(Dynamic &ioHash,String inKey)
 {
-   if (!ioHash.mPtr) return false;
-
-   #if defined(HX_WINDOWS) && !defined(HXCPP_WINRT)
-   __try {
-      StringHashBase *hash = static_cast<StringHashBase *>(ioHash.GetPtr());
-      if (!hash) return false;
-      return hash->exists(inKey);
-   }
-   __except(1) {
-      return false;
-   }
-   #else
-   // Non-Windows platforms: Safe check
    StringHashBase *hash = static_cast<StringHashBase *>(ioHash.GetPtr());
    if (!hash)
       return false;
-      
-   // Verify pointer alignment and basic validity if possible
-   if (((size_t)hash & 3) != 0) return false;
-   
    return hash->exists(inKey);
-   #endif
 }
 
 bool  __string_hash_remove(Dynamic &ioHash,String inKey)
