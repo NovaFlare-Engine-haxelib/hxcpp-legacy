@@ -4774,6 +4774,8 @@ public:
    volatile ConcurrentGCState gConcurrentState = gcStateNone;
    
    #ifdef HXCPP_GC_CONCURRENT
+   bool gConcurrentMarkingActive = false;
+   
    hx::HxSemaphore gConcurrentSignal;
    #endif
    
@@ -4790,9 +4792,6 @@ public:
                #ifdef HX_MULTI_THREAD_MARKING
                StartThreadJobs(tpjMark, MAX_GC_THREADS, true);
                #endif
-               
-               // Signal completion or update state
-               // Transition to Sweeping state
                gConcurrentState = gcStateSweeping;
            }
            
@@ -4831,6 +4830,10 @@ public:
                
                // Signal completion
                gConcurrentState = gcStateNone;
+               
+               #ifdef HXCPP_GC_CONCURRENT
+               gConcurrentMarkingActive = false;
+               #endif
            }
        }
        #endif
@@ -4838,17 +4841,8 @@ public:
 
    void MarkAll(bool inGenerational)
    {
-      #ifdef HXCPP_GC_CONCURRENT
-      if (gConcurrentMarkingActive && !inGenerational)
-      {
-          // Concurrent marking path
-          gConcurrentState = gcStateMarking;
-          gConcurrentSignal.Set();
-         
-          return;
-      }
-      #endif
-
+      // MOVED: Concurrent check is now done AFTER root marking
+      
       if (!inGenerational)
       {
          hx::gPrevByteMarkID = hx::gByteMarkID;
@@ -4936,6 +4930,17 @@ public:
       for(int i=0;i<hx::sZombieList.size();i++)
          hx::MarkObjectAlloc(hx::sZombieList[i] , &mMarker );
       } // automark
+
+      #ifdef HXCPP_GC_CONCURRENT
+      if (gConcurrentMarkingActive && !inGenerational)
+      {
+          // Concurrent marking path - Trigger AFTER roots are marked
+          gConcurrentState = gcStateMarking;
+          gConcurrentSignal.Set();
+         
+          return;
+      }
+      #endif
 
       MEM_STAMP(tMarkLocal);
       hx::localCount = 0;
