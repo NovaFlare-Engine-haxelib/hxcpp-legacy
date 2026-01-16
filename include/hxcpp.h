@@ -282,7 +282,14 @@ namespace hx { HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic Rethrow(Dynamic inDynamic);
 namespace hx { HXCPP_EXTERN_CLASS_ATTRIBUTES void CriticalError(const String &inError, bool inAllowFixup=false); }
 namespace hx { HXCPP_EXTERN_CLASS_ATTRIBUTES void NullReference(const char *type, bool allowFixup); }
 namespace hx { extern String sNone[]; }
-void __hxcpp_check_overflow(int inVal);
+
+HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_check_overflow(int inVal);
+
+HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_safe_point();
+HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_spam_collects(int inEveryNCalls);
+
+HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_working_memory(int inBytes);
+HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_free_space(int inBytes);
 
 namespace hx
 {

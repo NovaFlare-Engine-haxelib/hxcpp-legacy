@@ -31,6 +31,7 @@ namespace hx
 
    #ifdef HXCPP_GC_CONCURRENT
    bool gConcurrentMarkingActive = false;
+   bool gConcurrentRequested = false;
    #endif
 
 
@@ -447,19 +448,47 @@ DECLARE_FAST_TLS_DATA(StackContext, tlsStackContext);
 #ifdef HXCPP_SCRIPTABLE
 extern void scriptMarkStack(hx::MarkContext *);
 #endif
-}
+   // Concurrent GC API Implementation
+    void __hxcpp_gc_start_concurrent_mark() {
+       #ifdef HXCPP_GC_CONCURRENT
+       // Trigger a special collect that only does root scanning and starts concurrent marking
+       hx::gConcurrentRequested = true;
+       hx::InternalCollect(true, false); 
+       #endif
+    }
+
+   bool __hxcpp_gc_is_concurrent_marking() {
+      #ifdef HXCPP_GC_CONCURRENT
+      return hx::gConcurrentState == hx::gcStateMarking;
+      #else
+      return false;
+      #endif
+   }
+
+   void __hxcpp_gc_finish_concurrent_mark() {
+      #ifdef HXCPP_GC_CONCURRENT
+      // Force wait for concurrent marking to finish
+      while(hx::gConcurrentState != hx::gcStateNone) {
+          hx::OS::Sleep(1);
+      }
+      #endif
+   }
+} // end namespace hx
+
+// External C API wrappers
+void __hxcpp_gc_start_concurrent_mark() { hx::__hxcpp_gc_start_concurrent_mark(); }
+bool __hxcpp_gc_is_concurrent_marking() { return hx::__hxcpp_gc_is_concurrent_marking(); }
+void __hxcpp_gc_finish_concurrent_mark() { hx::__hxcpp_gc_finish_concurrent_mark(); }
+
+// ---  Internal GC - IMMIX Implementation ------------------------------
 
 //#define DEBUG_ALLOC_PTR ((char *)0xb68354)
-
 
 #ifdef HX_WINDOWS
 #define ZERO_MEM(ptr, n) ZeroMemory(ptr,n)
 #else
 #define ZERO_MEM(ptr, n) memset(ptr,0,n)
 #endif
-
-
-// ---  Internal GC - IMMIX Implementation ------------------------------
 
 
 
@@ -1589,10 +1618,19 @@ struct GlobalChunks
       return 0;
    }
 
+   // Add a chunk to the list, assuming we are the collector and no one else is running
+   // WARNING: This is NOT thread safe if other threads are running!
+   // In Concurrent GC mode, we must use atomic operations.
    void addLocked(MarkChunk *inChunk)
    {
+      #ifdef HXCPP_GC_CONCURRENT
+      // In concurrent mode, use atomic push to ensure safety
+      if (inChunk)
+         pushJob(inChunk);
+      #else
       inChunk->next = (MarkChunk *)processList;
       processList = (volatile MarkChunk *)inChunk;
+      #endif
    }
 
    void copyPointers( QuickVec<hx::Object *> &outPointers,bool andFree=false)
@@ -3381,6 +3419,10 @@ public:
    #endif
    BlockDataInfo *GetNextFree(int inRequiredBytes)
    {
+      #ifdef HXCPP_GC_CONCURRENT
+      hx::AutoLock lock(mFreeBlockListLock);
+      #endif
+
       bool failedLock = true;
       int sizeSlot = inRequiredBytes>>IMMIX_LINE_BITS;
       if (sizeSlot>=BLOCK_OFSIZE_COUNT)
@@ -3511,6 +3553,12 @@ public:
 
       int n = 1<<IMMIX_BLOCK_GROUP_BITS;
 
+
+      // AllocMoreBlocks modifies mAllBlocks and mFreeBlocks.
+      #ifdef HXCPP_GC_CONCURRENT
+      hx::AutoLock lock1(mBlockListLock);
+      hx::AutoLock lock2(mFreeBlockListLock);
+      #endif
 
       if (!mAllBlocks.safeReserveExtra(n) || !mFreeBlocks.hasExtraCapacity(n))
       {
@@ -4699,8 +4747,91 @@ public:
    double tMarkLocal;
    double tMarkLocalEnd;
    double tMarked;
+   // Concurrent GC State Machine
+   enum ConcurrentGCState {
+      gcStateNone,
+      gcStateMarking,
+      gcStateSweeping
+   };
+   
+   volatile ConcurrentGCState gConcurrentState = gcStateNone;
+   
+   #ifdef HXCPP_GC_CONCURRENT
+   hx::HxSemaphore gConcurrentSignal;
+   #endif
+   
+   void ConcurrentGCThreadFunc(void *)
+   {
+       #ifdef HXCPP_GC_CONCURRENT
+       while(true)
+       {
+           gConcurrentSignal.Wait();
+           
+           if (gConcurrentState == gcStateMarking)
+           {
+               // Perform concurrent marking
+               #ifdef HX_MULTI_THREAD_MARKING
+               StartThreadJobs(tpjMark, MAX_GC_THREADS, true);
+               #endif
+               
+               // Signal completion or update state
+               // Transition to Sweeping state
+               gConcurrentState = gcStateSweeping;
+           }
+           
+           if (gConcurrentState == gcStateSweeping)
+           {
+               // Perform concurrent sweeping
+               if (hx::sGlobalAlloc) {
+                   hx::BlockDataStats stats;
+                   {
+                       hx::AutoLock lock(hx::sGlobalAlloc->mBlockListLock);
+                       hx::sGlobalAlloc->reclaimBlocks(false, stats);
+                   }
+
+                   {
+                       hx::AutoLock lock(hx::sGlobalAlloc->mBlockListLock);
+                       
+                       // Try to release empty groups to OS
+                       // This actually reduces MemReserved (system memory usage)
+                       hx::BlockDataStats releaseStats;
+                       // Try to release up to 64MB per GC cycle
+                       hx::sGlobalAlloc->releaseEmptyGroups(releaseStats, 64*1024*1024);
+                       
+                       hx::sGlobalAlloc->createFreeList();
+                       
+                       // UPDATE GLOBAL STATS
+                       // Without this, the allocator thinks memory is still full!
+                       hx::sGlobalAlloc->mRowsInUse = stats.rowsInUse;
+                       hx::sGlobalAlloc->mCurrentRowsInUse = stats.rowsInUse;
+                       // Also update block count stats since releaseEmptyGroups might have reduced it
+                       hx::sGlobalAlloc->mAllBlocksCount = hx::sGlobalAlloc->mAllBlocks.size();
+                       
+                       // Trigger background zeroing
+                       hx::sGlobalAlloc->backgroundProcessFreeList(true);
+                   }
+               }
+               
+               // Signal completion
+               gConcurrentState = gcStateNone;
+           }
+       }
+       #endif
+   }
+
    void MarkAll(bool inGenerational)
    {
+      #ifdef HXCPP_GC_CONCURRENT
+      if (gConcurrentMarkingActive && !inGenerational)
+      {
+          // Concurrent marking path
+          gConcurrentState = gcStateMarking;
+          gConcurrentSignal.Set();
+         
+          return;
+      }
+      #endif
+
       if (!inGenerational)
       {
          hx::gPrevByteMarkID = hx::gByteMarkID;
@@ -4988,7 +5119,47 @@ public:
 
       STAMP(t1)
 
+      #ifdef HXCPP_GC_CONCURRENT
+       // Activate concurrent marking if appropriate
+       if (!generational && !inForceCompact && hx::gConcurrentRequested)
+       {
+           gConcurrentMarkingActive = true;
+           hx::gConcurrentRequested = false;
+           // Trigger concurrent marking thread if not already running
+           if (gConcurrentState == gcStateNone)
+           {
+              // Initialize concurrent thread if needed (lazy init)
+              static bool sConcurrentThreadStarted = false;
+              if (!sConcurrentThreadStarted)
+              {
+                  hx::HxCreateDetachedThread(ConcurrentGCThreadFunc, 0);
+                  sConcurrentThreadStarted = true;
+              }
+           }
+       }
+       #endif
+
       MarkAll(generational);
+
+      #ifdef HXCPP_GC_CONCURRENT
+      if (gConcurrentMarkingActive)
+      {
+          sgIsCollecting = false;
+          // Release locks and resume threads
+           #ifndef HXCPP_SINGLE_THREADED_APP
+           if (!inLocked)
+              gThreadStateChangeLock->Unlock();
+           for(int i=0;i<mLocalAllocs.size();i++)
+              if (mLocalAllocs[i]!=this_local)
+                 ReleaseFromSafe(mLocalAllocs[i]);
+           #endif
+           
+           // Clear the global pause flag so others can run
+           _hx_atomic_exchange(&hx::gPauseForCollect, 0);
+           
+           return; 
+      }
+      #endif
 
       #ifdef HX_GC_VERIFY_GENERATIONAL
       {
@@ -5489,6 +5660,10 @@ public:
    // buils mFreeBlocks and maybe starts the async-zero process on mZeroList
    void createFreeList()
    {
+      #ifdef HXCPP_GC_CONCURRENT
+      hx::AutoLock lock(mFreeBlockListLock);
+      #endif
+
       mFreeBlocks.clear();
 
       for(int i=0;i<mAllBlocks.size();i++)
