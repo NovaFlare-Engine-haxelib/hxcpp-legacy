@@ -4980,25 +4980,25 @@ public:
          hx::MarkObjectAlloc(hx::sZombieList[i] , &mMarker );
       } // automark
 
+      // Mark local stacks - MUST be done before resuming threads in concurrent mode!
+      MEM_STAMP(tMarkLocal);
+      hx::localCount = 0;
+
+      mMarker.isGenerational = inGenerational;
+
+      for(int i=0;i<mLocalAllocs.size();i++)
+         MarkLocalAlloc(mLocalAllocs[i] , &mMarker);
+
       #ifdef HXCPP_GC_CONCURRENT
       if (gConcurrentMarkingActive && !inGenerational)
       {
-          // Concurrent marking path - Trigger AFTER roots are marked
+          // Concurrent marking path - Trigger AFTER roots and stacks are marked
           gConcurrentState = gcStateMarking;
           gConcurrentSignal.Set();
          
           return;
       }
       #endif
-
-      MEM_STAMP(tMarkLocal);
-      hx::localCount = 0;
-
-      mMarker.isGenerational = inGenerational;
-
-      // Mark local stacks
-      for(int i=0;i<mLocalAllocs.size();i++)
-         MarkLocalAlloc(mLocalAllocs[i] , &mMarker);
 
       #ifdef PROFILE_COLLECT
       hx::localObjects = sObjectMarks;
@@ -5272,7 +5272,11 @@ public:
          sgTimeToNextTableUpdate--;
       }
 
+      #ifdef HXCPP_GC_CONCURRENT
+      bool full = inMajor || inForceCompact;
+      #else
       bool full = inMajor || (sgTimeToNextTableUpdate<=0) || inForceCompact;
+      #endif
 
       // Setup memory target ...
       // Count free rows, and prep blocks for sorting
@@ -5339,12 +5343,14 @@ public:
          // Could be either expanding, or fragmented...
          if (useRatio>0.75)
          {
+            #ifndef HXCPP_GC_CONCURRENT
             #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
                GCLOG("Do full stats\n", useRatio);
             #endif
             full = true;
             stats.clear();
             reclaimBlocks(full,stats);
+            #endif
          }
       }
       #endif
