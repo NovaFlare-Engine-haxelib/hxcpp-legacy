@@ -449,8 +449,21 @@ DECLARE_FAST_TLS_DATA(StackContext, tlsStackContext);
 extern void scriptMarkStack(hx::MarkContext *);
 #endif
    // Concurrent GC API Implementation
+   #ifdef HXCPP_GC_CONCURRENT
+   static double sLastConcurrentGCRequestTime = 0.0;
+   #endif
+
     void __hxcpp_gc_start_concurrent_mark() {
        #ifdef HXCPP_GC_CONCURRENT
+       // COOLDOWN: Don't trigger concurrent GC too frequently!
+       // Default: 0.5s
+       double now = hx::OS::GetTime();
+       if (now - sLastConcurrentGCRequestTime < 0.5)
+       {
+           return;
+       }
+       sLastConcurrentGCRequestTime = now;
+
        // Trigger a special collect that only does root scanning and starts concurrent marking
        hx::gConcurrentRequested = true;
        hx::InternalCollect(true, false); 
@@ -3277,8 +3290,6 @@ public:
       if (hx::gPauseForCollect)
          __hxcpp_gc_safe_point();
 
-      //Should we force a collect ? - the 'large' data are not considered when allocating objects
-      // from the blocks, and can 'pile up' between smalll object allocations
       if ((inSize+mLargeAllocated > mLargeAllocForceRefresh) && sgInternalEnable)
       {
          #ifdef SHOW_MEM_EVENTS
@@ -3701,7 +3712,20 @@ public:
          if (!result)
          {
             inAlloc->SetupStackAndCollect(false,forceCompact,true,true);
-            result = GetNextFree(inRequiredBytes);
+            
+            #ifdef HXCPP_GC_CONCURRENT
+            if (gConcurrentMarkingActive || gConcurrentState != gcStateNone)
+            {
+                while (gConcurrentMarkingActive || gConcurrentState != gcStateNone)
+                {
+                   gSweepFinishedSignal.WaitSeconds(0.001);
+                }
+                result = GetNextFree(inRequiredBytes);
+            }
+            #endif
+
+            if (!result)
+                result = GetNextFree(inRequiredBytes);
          }
 
          if (!result && !forceCompact)
@@ -4791,6 +4815,7 @@ public:
    volatile bool gConcurrentFinalizersPending = false;
    
    hx::HxSemaphore gConcurrentSignal;
+   hx::HxSemaphore gSweepFinishedSignal;
    #endif
    
    void ConcurrentGCThreadFunc(void *)
@@ -4858,6 +4883,7 @@ public:
                
                #ifdef HXCPP_GC_CONCURRENT
                gConcurrentMarkingActive = false;
+               gSweepFinishedSignal.Set();
                #endif
            }
        }
