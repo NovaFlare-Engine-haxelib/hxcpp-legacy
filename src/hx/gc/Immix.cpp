@@ -3284,7 +3284,12 @@ public:
          #ifdef SHOW_MEM_EVENTS
          //GCLOG("Large alloc causing collection");
          #endif
+         
+         #ifdef HXCPP_GC_CONCURRENT
+         __hxcpp_gc_start_concurrent_mark();
+         #else
          CollectFromThisThread(false,false);
+         #endif
       }
 
       inSize = (inSize +3) & ~3;
