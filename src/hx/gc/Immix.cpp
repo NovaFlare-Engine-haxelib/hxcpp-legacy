@@ -1460,7 +1460,10 @@ bool BiggestFreeFirst(BlockDataInfo *inA, BlockDataInfo *inB)
 }
 bool SmallestFreeFirst(BlockDataInfo *inA, BlockDataInfo *inB)
 {
-   return inA->mMaxHoleSize < inB->mMaxHoleSize;
+   if (inA->mMaxHoleSize < inB->mMaxHoleSize) return true;
+   if (inA->mMaxHoleSize > inB->mMaxHoleSize) return false;
+   
+   return inA->getUsedRows() > inB->getUsedRows();
 }
 
 
@@ -3676,8 +3679,11 @@ public:
          #ifdef HXCPP_GC_CONCURRENT
          if (!allowGrowth && gConcurrentState != gcStateNone)
          {
-             // Concurrent GC is running, let's allow growth to avoid STW!
-             allowGrowth = true;
+             size_t maxOverAlloc = sWorkingMemorySize + (sWorkingMemorySize >> 1); // 1.5x
+             if (GetWorkingMemory() < maxOverAlloc)
+             {
+                 allowGrowth = true;
+             }
          }
          #endif
 
@@ -4776,6 +4782,9 @@ public:
    #ifdef HXCPP_GC_CONCURRENT
    bool gConcurrentMarkingActive = false;
    
+   // Flag to indicate that the concurrent thread has found zombies that need processing
+   volatile bool gConcurrentFinalizersPending = false;
+   
    hx::HxSemaphore gConcurrentSignal;
    #endif
    
@@ -4792,6 +4801,17 @@ public:
                #ifdef HX_MULTI_THREAD_MARKING
                StartThreadJobs(tpjMark, MAX_GC_THREADS, true);
                #endif
+            
+               {
+                   hx::AutoLock lock(*gSpecialObjectLock);
+                   hx::FindZombies(sGlobalAlloc->mMarker);
+               }
+               
+               if (hx::sZombieList.size() > 0)
+               {
+                   gConcurrentFinalizersPending = true;
+               }
+               
                gConcurrentState = gcStateSweeping;
            }
            
@@ -5142,9 +5162,19 @@ public:
       STAMP(t1)
 
       #ifdef HXCPP_GC_CONCURRENT
-       // Activate concurrent marking if appropriate
+       if (hx::gConcurrentRequested && !inForceCompact)
+       {
+           generational = false;
+       }
+       
        if (!generational && !inForceCompact && hx::gConcurrentRequested)
        {
+           if (gConcurrentFinalizersPending)
+           {
+               hx::RunFinalizers();
+               gConcurrentFinalizersPending = false;
+           }
+       
            gConcurrentMarkingActive = true;
            hx::gConcurrentRequested = false;
            // Trigger concurrent marking thread if not already running
@@ -5179,6 +5209,12 @@ public:
            // Clear the global pause flag so others can run
            _hx_atomic_exchange(&hx::gPauseForCollect, 0);
            
+           #ifdef HXCPP_GC_MOVING
+           sgTimeToNextTableUpdate = 7;
+           #else
+           sgTimeToNextTableUpdate = 15;
+           #endif
+           
            return; 
       }
       #endif
@@ -5201,12 +5237,11 @@ public:
       STAMP(t2)
 
 
-      // Sweep blocks
 
-      // Update table entries?  This needs to be done before the gMarkID count clocks
-      //  back to the same number
       if (!generational)
+      {
          sgTimeToNextTableUpdate--;
+      }
 
       bool full = inMajor || (sgTimeToNextTableUpdate<=0) || inForceCompact;
 
