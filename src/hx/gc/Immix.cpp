@@ -3695,11 +3695,7 @@ public:
          #ifdef HXCPP_GC_CONCURRENT
          if (!allowGrowth && gConcurrentState != gcStateNone)
          {
-             size_t maxOverAlloc = sWorkingMemorySize + (sWorkingMemorySize >> 1); // 1.5x
-             if (GetWorkingMemory() < maxOverAlloc)
-             {
-                 allowGrowth = true;
-             }
+             allowGrowth = true;
          }
          #endif
 
@@ -3716,11 +3712,19 @@ public:
             #ifdef HXCPP_GC_CONCURRENT
             if (gConcurrentMarkingActive || gConcurrentState != gcStateNone)
             {
-                while (gConcurrentMarkingActive || gConcurrentState != gcStateNone)
+                if (allowMoreBlocks() && AllocMoreBlocks(forceCompact, false))
                 {
-                   gSweepFinishedSignal.WaitSeconds(0.001);
+                   result = GetNextFree(inRequiredBytes);
                 }
-                result = GetNextFree(inRequiredBytes);
+                
+                if (!result)
+                {
+                   while (gConcurrentMarkingActive || gConcurrentState != gcStateNone)
+                   {
+                      gSweepFinishedSignal.WaitSeconds(0.001);
+                   }
+                   result = GetNextFree(inRequiredBytes);
+                }
             }
             #endif
 
@@ -5177,6 +5181,14 @@ public:
       #ifdef HXCPP_GC_GENERATIONAL
       hx::QuickVec<hx::Object *> rememberedSet;
       generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
+      
+      #ifdef HXCPP_GC_CONCURRENT
+      if (!generational && !inForceCompact && gConcurrentState == gcStateNone)
+      {
+          hx::gConcurrentRequested = true;
+      }
+      #endif
+
       if (sGcMode==gcmGenerational)
       {
          hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
@@ -5191,6 +5203,13 @@ public:
       STAMP(t1)
 
       #ifdef HXCPP_GC_CONCURRENT
+      static bool sConcurrentThreadStarted = false;
+      if (!sConcurrentThreadStarted)
+      {
+          hx::HxCreateDetachedThread(ConcurrentGCThreadFunc, 0);
+          sConcurrentThreadStarted = true;
+      }
+      
        if (hx::gConcurrentRequested && !inForceCompact)
        {
            generational = false;
@@ -5206,16 +5225,10 @@ public:
        
            gConcurrentMarkingActive = true;
            hx::gConcurrentRequested = false;
-           // Trigger concurrent marking thread if not already running
+           // Thread is already started above
            if (gConcurrentState == gcStateNone)
            {
-              // Initialize concurrent thread if needed (lazy init)
-              static bool sConcurrentThreadStarted = false;
-              if (!sConcurrentThreadStarted)
-              {
-                  hx::HxCreateDetachedThread(ConcurrentGCThreadFunc, 0);
-                  sConcurrentThreadStarted = true;
-              }
+              // Just ensure it's running (it should be waiting on signal)
            }
        }
        #endif
