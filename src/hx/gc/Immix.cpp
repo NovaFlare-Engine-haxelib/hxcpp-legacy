@@ -3184,6 +3184,26 @@ static int sMaxZeroQueueSize = 32;
 #define BLOCK_OFSIZE_COUNT 12
 
 
+   // Concurrent GC State Machine
+   enum ConcurrentGCState {
+      gcStateNone,
+      gcStateMarking,
+      gcStateSweeping
+   };
+   
+   volatile ConcurrentGCState gConcurrentState = gcStateNone;
+   
+   #ifdef HXCPP_GC_CONCURRENT
+   bool gConcurrentMarkingActive = false;
+   
+   // Flag to indicate that the concurrent thread has found zombies that need processing
+   volatile bool gConcurrentFinalizersPending = false;
+   
+   hx::HxSemaphore gConcurrentSignal;
+   hx::HxSemaphore gSweepFinishedSignal;
+   #endif
+
+
 class GlobalAllocator
 {
    enum { LOCAL_POOL_SIZE = 2 };
@@ -3638,6 +3658,10 @@ public:
 
    bool allowMoreBlocks()
    {
+      #ifdef HXCPP_GC_CONCURRENT
+      if (gConcurrentState != gcStateNone) return true;
+      #endif
+
       #ifdef HXCPP_GC_GENERATIONAL
       return sGcMode==gcmFull;
       #else
@@ -4803,24 +4827,7 @@ public:
    double tMarkLocal;
    double tMarkLocalEnd;
    double tMarked;
-   // Concurrent GC State Machine
-   enum ConcurrentGCState {
-      gcStateNone,
-      gcStateMarking,
-      gcStateSweeping
-   };
-   
-   volatile ConcurrentGCState gConcurrentState = gcStateNone;
-   
-   #ifdef HXCPP_GC_CONCURRENT
-   bool gConcurrentMarkingActive = false;
-   
-   // Flag to indicate that the concurrent thread has found zombies that need processing
-   volatile bool gConcurrentFinalizersPending = false;
-   
-   hx::HxSemaphore gConcurrentSignal;
-   hx::HxSemaphore gSweepFinishedSignal;
-   #endif
+
    
    void ConcurrentGCThreadFunc(void *)
    {
@@ -5183,8 +5190,23 @@ public:
       generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
       
       #ifdef HXCPP_GC_CONCURRENT
-      if (!generational && !inForceCompact && gConcurrentState == gcStateNone)
+      if (!generational && !inForceCompact)
       {
+          if (gConcurrentState != gcStateNone || gConcurrentMarkingActive)
+          {
+             // Do not wait - try to alloc more blocks instead
+             sgIsCollecting = false;
+             #ifndef HXCPP_SINGLE_THREADED_APP
+             if (!inLocked)
+                gThreadStateChangeLock->Unlock();
+             for(int i=0;i<mLocalAllocs.size();i++)
+                if (mLocalAllocs[i]!=this_local)
+                   ReleaseFromSafe(mLocalAllocs[i]);
+             #endif
+             _hx_atomic_exchange(&hx::gPauseForCollect, 0);
+             return;
+          }
+          
           hx::gConcurrentRequested = true;
       }
       #endif
@@ -5215,6 +5237,13 @@ public:
            generational = false;
        }
        
+       if (!generational && !inForceCompact)
+       {
+           // Force concurrent request if we are doing a full GC
+           if (gConcurrentState == gcStateNone || hx::gConcurrentRequested)
+               hx::gConcurrentRequested = true;
+       }
+
        if (!generational && !inForceCompact && hx::gConcurrentRequested)
        {
            if (gConcurrentFinalizersPending)
@@ -5304,7 +5333,7 @@ public:
          countRows(stats);
          size_t currentRows = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
          double filled = (double)(currentRows) / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
-         if (filled>0.85)
+         if (filled>0.92)
          {
             // Failure of generational estimation
             int retained = currentRows - mRowsInUse;
