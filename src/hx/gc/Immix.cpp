@@ -2686,7 +2686,7 @@ static int localAllocs;
 static int rootObjects;
 static int rootAllocs;
 
-void RunFinalizers()
+void RunFinalizers(int inMaxCount=-1)
 {
    finalizerCount = 0;
 
@@ -2694,9 +2694,23 @@ void RunFinalizers()
    int idx = 0;
    while(idx<list.size())
    {
-      InternalFinalizer *f = list[idx];
+      if (inMaxCount>0 && finalizerCount>=inMaxCount)
+         break;
+
+      InternalFinalizer *f = 0;
+      {
+         #ifdef HXCPP_GC_CONCURRENT
+         hx::AutoLock lock(*sFinalizerLock);
+         if (idx >= list.size()) break;
+         #endif
+         f = list[idx];
+      }
+
       if (!f->mValid)
       {
+         #ifdef HXCPP_GC_CONCURRENT
+         hx::AutoLock lock(*sFinalizerLock);
+         #endif
          list.qerase(idx);
          delete f;
       }
@@ -2707,6 +2721,9 @@ void RunFinalizers()
             f->mFinalizer(f->mObject);
             finalizerCount++;
          }
+         #ifdef HXCPP_GC_CONCURRENT
+         hx::AutoLock lock(*sFinalizerLock);
+         #endif
          list.qerase(idx);
          delete f;
       }
@@ -3726,7 +3743,16 @@ public:
          if (!result && allowMoreBlocks() && allowGrowth)
          {
             if (AllocMoreBlocks(forceCompact,false))
+            {
+               #ifdef HXCPP_GC_CONCURRENT
+               if (gConcurrentFinalizersPending && !hx::gPauseForCollect)
+               {
+                  hx::RunFinalizers(16);
+               }
+               #endif
+
                result = GetNextFree(inRequiredBytes);
+            }
          }
 
          if (!result)
