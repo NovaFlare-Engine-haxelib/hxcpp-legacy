@@ -4424,13 +4424,13 @@ public:
       while(!sgThreadPoolAbort)
       {
          int blockId = _hx_atomic_add(&mThreadJobId, 1);
-         if (blockId>=mAllBlocks.size())
+         if (blockId>=mReclaimSnapshot.size())
             break;
 
          if ( sgThreadPoolJob==tpjReclaimFull)
-            mAllBlocks[blockId]->reclaim<true>(&outStats);
+            mReclaimSnapshot[blockId]->reclaim<true>(&outStats);
          else
-            mAllBlocks[blockId]->reclaim<false>(&outStats);
+            mReclaimSnapshot[blockId]->reclaim<false>(&outStats);
       }
    }
 
@@ -4850,10 +4850,8 @@ public:
                // Perform concurrent sweeping
                if (hx::sGlobalAlloc) {
                    hx::BlockDataStats stats;
-                   {
-                       hx::AutoLock lock(hx::sGlobalAlloc->mBlockListLock);
-                       hx::sGlobalAlloc->reclaimBlocks(false, stats);
-                   }
+                   
+                   hx::sGlobalAlloc->reclaimBlocks(false, stats);
 
                    {
                        hx::AutoLock lock(hx::sGlobalAlloc->mBlockListLock);
@@ -5702,25 +5700,54 @@ public:
 
    void reclaimBlocks(bool full, BlockDataStats &outStats)
    {
+      #ifdef HXCPP_GC_CONCURRENT
+      if (gConcurrentState != gcStateNone)
+      {
+          hx::AutoLock lock(mBlockListLock);
+          // Manually copy the vector since operator= is private
+          mReclaimSnapshot.setSize(mAllBlocks.size());
+          if (mAllBlocks.size() > 0) {
+              memcpy(mReclaimSnapshot.mPtr, mAllBlocks.mPtr, mAllBlocks.size() * sizeof(BlockDataInfo *));
+          }
+      }
+      else
+      {
+          // Manually copy the vector since operator= is private
+          mReclaimSnapshot.setSize(mAllBlocks.size());
+          if (mAllBlocks.size() > 0) {
+              memcpy(mReclaimSnapshot.mPtr, mAllBlocks.mPtr, mAllBlocks.size() * sizeof(BlockDataInfo *));
+          }
+      }
+      #else
+      // Manually copy the vector since operator= is private
+      mReclaimSnapshot.setSize(mAllBlocks.size());
+      if (mAllBlocks.size() > 0) {
+          memcpy(mReclaimSnapshot.mPtr, mAllBlocks.mPtr, mAllBlocks.size() * sizeof(BlockDataInfo *));
+      }
+      #endif
+
       if (MAX_GC_THREADS>1)
       {
          for(int i=0;i<MAX_GC_THREADS;i++)
             sThreadBlockDataStats[i].clear();
-         StartThreadJobs(full ? tpjReclaimFull : tpjReclaim, mAllBlocks.size(), true);
+         StartThreadJobs(full ? tpjReclaimFull : tpjReclaim, mReclaimSnapshot.size(), true);
          outStats = sThreadBlockDataStats[0];
          for(int i=1;i<MAX_GC_THREADS;i++)
             outStats.add(sThreadBlockDataStats[i]);
+         
+         mReclaimSnapshot.clear();
       }
       else
       {
          outStats.clear();
-         for(int i=0;i<mAllBlocks.size();i++)
+         for(int i=0;i<mReclaimSnapshot.size();i++)
          {
             if (full)
-               mAllBlocks[i]->reclaim<true>(&outStats);
+               mReclaimSnapshot[i]->reclaim<true>(&outStats);
             else
-               mAllBlocks[i]->reclaim<false>(&outStats);
+               mReclaimSnapshot[i]->reclaim<false>(&outStats);
          }
+         mReclaimSnapshot.clear();
       }
    }
 
@@ -5905,6 +5932,7 @@ public:
    volatile int mThreadJobId;
 
    BlockList mAllBlocks;
+   BlockList mReclaimSnapshot;
    BlockList mFreeBlocks;
    BlockList mZeroList;
    volatile int mZeroListQueue;
