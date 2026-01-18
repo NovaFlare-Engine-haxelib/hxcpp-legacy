@@ -453,26 +453,23 @@ extern void scriptMarkStack(hx::MarkContext *);
    static double sLastConcurrentGCRequestTime = 0.0;
    #endif
 
-    void __hxcpp_gc_start_concurrent_mark() {
-       #ifdef HXCPP_GC_CONCURRENT
-       // COOLDOWN: Don't trigger concurrent GC too frequently!
-       // Default: 0.5s
-       double now = hx::OS::GetTime();
-       if (now - sLastConcurrentGCRequestTime < 0.5)
-       {
-           return;
-       }
-       sLastConcurrentGCRequestTime = now;
+    void __hxcpp_gc_start_concurrent_mark_impl();
+    bool __hxcpp_gc_is_concurrent_marking_impl();
+    void __hxcpp_gc_finish_concurrent_mark_impl();
 
-       // Trigger a special collect that only does root scanning and starts concurrent marking
-       hx::gConcurrentRequested = true;
-       hx::InternalCollect(true, false); 
+    void __hxcpp_gc_start_concurrent_mark() {
+       // DEBUG: Check if function is called and macro is defined
+       #ifndef HXCPP_GC_CONCURRENT
+       printf("[并发GC] 警告: __hxcpp_gc_start_concurrent_mark 被调用，但 HXCPP_GC_CONCURRENT 宏未定义！并发 GC 未启用。\n");
+       printf("[并发GC] 请在编译参数中添加 -D HXCPP_GC_CONCURRENT\n");
+       #else
+       __hxcpp_gc_start_concurrent_mark_impl();
        #endif
     }
 
    bool __hxcpp_gc_is_concurrent_marking() {
       #ifdef HXCPP_GC_CONCURRENT
-      return hx::gConcurrentState == hx::gcStateMarking;
+      return __hxcpp_gc_is_concurrent_marking_impl();
       #else
       return false;
       #endif
@@ -480,10 +477,7 @@ extern void scriptMarkStack(hx::MarkContext *);
 
    void __hxcpp_gc_finish_concurrent_mark() {
       #ifdef HXCPP_GC_CONCURRENT
-      // Force wait for concurrent marking to finish
-      while(hx::gConcurrentState != hx::gcStateNone) {
-          hx::OS::Sleep(1);
-      }
+      __hxcpp_gc_finish_concurrent_mark_impl();
       #endif
    }
 } // end namespace hx
@@ -1642,7 +1636,7 @@ struct GlobalChunks
       #ifdef HXCPP_GC_CONCURRENT
       // In concurrent mode, use atomic push to ensure safety
       if (inChunk)
-         pushJob(inChunk);
+         pushJob(inChunk, false);
       #else
       inChunk->next = (MarkChunk *)processList;
       processList = (volatile MarkChunk *)inChunk;
@@ -2700,7 +2694,7 @@ void RunFinalizers(int inMaxCount=-1)
       InternalFinalizer *f = 0;
       {
          #ifdef HXCPP_GC_CONCURRENT
-         hx::AutoLock lock(*sFinalizerLock);
+         AutoLock lock(*sFinalizerLock);
          if (idx >= list.size()) break;
          #endif
          f = list[idx];
@@ -2709,7 +2703,7 @@ void RunFinalizers(int inMaxCount=-1)
       if (!f->mValid)
       {
          #ifdef HXCPP_GC_CONCURRENT
-         hx::AutoLock lock(*sFinalizerLock);
+         AutoLock lock(*sFinalizerLock);
          #endif
          list.qerase(idx);
          delete f;
@@ -2722,7 +2716,7 @@ void RunFinalizers(int inMaxCount=-1)
             finalizerCount++;
          }
          #ifdef HXCPP_GC_CONCURRENT
-         hx::AutoLock lock(*sFinalizerLock);
+         AutoLock lock(*sFinalizerLock);
          #endif
          list.qerase(idx);
          delete f;
@@ -3216,8 +3210,8 @@ static int sMaxZeroQueueSize = 32;
    // Flag to indicate that the concurrent thread has found zombies that need processing
    volatile bool gConcurrentFinalizersPending = false;
    
-   hx::HxSemaphore gConcurrentSignal;
-   hx::HxSemaphore gSweepFinishedSignal;
+   HxSemaphore gConcurrentSignal;
+   HxSemaphore gSweepFinishedSignal;
    #endif
 
 
@@ -3243,6 +3237,12 @@ public:
 
       createFreeList();
    }
+   // Concurrent GC locks
+   #ifdef HXCPP_GC_CONCURRENT
+   HxMutex mBlockListLock;
+   HxMutex mFreeBlockListLock;
+   #endif
+
    void AddLocal(LocalAllocator *inAlloc)
    {
       if (!gThreadStateChangeLock)
@@ -3476,7 +3476,7 @@ public:
    BlockDataInfo *GetNextFree(int inRequiredBytes)
    {
       #ifdef HXCPP_GC_CONCURRENT
-      hx::AutoLock lock(mFreeBlockListLock);
+      AutoLock lock(mBlockListLock);
       #endif
 
       bool failedLock = true;
@@ -3612,8 +3612,7 @@ public:
 
       // AllocMoreBlocks modifies mAllBlocks and mFreeBlocks.
       #ifdef HXCPP_GC_CONCURRENT
-      hx::AutoLock lock1(mBlockListLock);
-      hx::AutoLock lock2(mFreeBlockListLock);
+      AutoLock lock1(mBlockListLock);
       #endif
 
       if (!mAllBlocks.safeReserveExtra(n) || !mFreeBlocks.hasExtraCapacity(n))
@@ -4861,16 +4860,21 @@ public:
        while(true)
        {
            gConcurrentSignal.Wait();
-           
+           double tStart = __hxcpp_time_stamp();
+           printf("[并发GC] 后台线程 (%lu): 唤醒. 状态: %d\n", GetCurrentThreadId(), gConcurrentState);
+
            if (gConcurrentState == gcStateMarking)
            {
+               printf("[并发GC] 后台线程 (%lu): 开始标记...\n", GetCurrentThreadId());
+               double tMarkStart = __hxcpp_time_stamp();
+
                // Perform concurrent marking
                #ifdef HX_MULTI_THREAD_MARKING
                StartThreadJobs(tpjMark, MAX_GC_THREADS, true);
                #endif
             
                {
-                   hx::AutoLock lock(*gSpecialObjectLock);
+                   AutoLock lock(*gSpecialObjectLock);
                    hx::FindZombies(sGlobalAlloc->mMarker);
                }
                
@@ -4879,37 +4883,43 @@ public:
                    gConcurrentFinalizersPending = true;
                }
                
+               double tMarkEnd = __hxcpp_time_stamp();
+               printf("[并发GC] 后台线程 (%lu): 标记完成. 耗时: %.6f 秒\n", GetCurrentThreadId(), tMarkEnd - tMarkStart);
+
                gConcurrentState = gcStateSweeping;
            }
            
            if (gConcurrentState == gcStateSweeping)
            {
+               printf("[并发GC] 后台线程 (%lu): 开始清扫...\n", GetCurrentThreadId());
+               double tSweepStart = __hxcpp_time_stamp();
+
                // Perform concurrent sweeping
-               if (hx::sGlobalAlloc) {
-                   hx::BlockDataStats stats;
+               if (sGlobalAlloc) {
+                   BlockDataStats stats;
                    
-                   hx::sGlobalAlloc->reclaimBlocks(false, stats);
+                   sGlobalAlloc->reclaimBlocks(false, stats);
 
                    {
-                       hx::AutoLock lock(hx::sGlobalAlloc->mBlockListLock);
+                       AutoLock lock(sGlobalAlloc->mBlockListLock);
                        
                        // Try to release empty groups to OS
                        // This actually reduces MemReserved (system memory usage)
-                       hx::BlockDataStats releaseStats;
+                       BlockDataStats releaseStats;
                        // Try to release up to 64MB per GC cycle
-                       hx::sGlobalAlloc->releaseEmptyGroups(releaseStats, 64*1024*1024);
+                       sGlobalAlloc->releaseEmptyGroups(releaseStats, 64*1024*1024);
                        
-                       hx::sGlobalAlloc->createFreeList();
+                       sGlobalAlloc->createFreeList();
                        
                        // UPDATE GLOBAL STATS
                        // Without this, the allocator thinks memory is still full!
-                       hx::sGlobalAlloc->mRowsInUse = stats.rowsInUse;
-                       hx::sGlobalAlloc->mCurrentRowsInUse = stats.rowsInUse;
+                       sGlobalAlloc->mRowsInUse = stats.rowsInUse;
+                       sGlobalAlloc->mCurrentRowsInUse = stats.rowsInUse;
                        // Also update block count stats since releaseEmptyGroups might have reduced it
-                       hx::sGlobalAlloc->mAllBlocksCount = hx::sGlobalAlloc->mAllBlocks.size();
+                       sGlobalAlloc->mAllBlocksCount = sGlobalAlloc->mAllBlocks.size();
                        
                        // Trigger background zeroing
-                       hx::sGlobalAlloc->backgroundProcessFreeList(true);
+                       sGlobalAlloc->backgroundProcessFreeList(true);
                    }
                }
                
@@ -4920,6 +4930,10 @@ public:
                gConcurrentMarkingActive = false;
                gSweepFinishedSignal.Set();
                #endif
+
+               double tSweepEnd = __hxcpp_time_stamp();
+               printf("[并发GC] 后台线程 (%lu): 清扫完成. 耗时: %.6f 秒\n", GetCurrentThreadId(), tSweepEnd - tSweepStart);
+               printf("[并发GC] 后台线程 (%lu): 周期结束. 总耗时 (从唤醒开始): %.6f 秒\n", GetCurrentThreadId(), tSweepEnd - tStart);
            }
        }
        #endif
@@ -5030,6 +5044,7 @@ public:
       if (gConcurrentMarkingActive && !inGenerational)
       {
           // Concurrent marking path - Trigger AFTER roots and stacks are marked
+          printf("[并发GC] 主线程 (%lu): 根对象标记完成. 移交给后台线程.\n", GetCurrentThreadId());
           gConcurrentState = gcStateMarking;
           gConcurrentSignal.Set();
          
@@ -5279,6 +5294,7 @@ public:
            }
        
            gConcurrentMarkingActive = true;
+           printf("[并发GC] 主线程 (%lu): 请求并发 GC. 开始根对象标记...\n", GetCurrentThreadId());
            hx::gConcurrentRequested = false;
            // Thread is already started above
            if (gConcurrentState == gcStateNone)
@@ -5777,7 +5793,7 @@ public:
       #ifdef HXCPP_GC_CONCURRENT
       if (gConcurrentState != gcStateNone)
       {
-          hx::AutoLock lock(mBlockListLock);
+          AutoLock lock(mBlockListLock);
           // Manually copy the vector since operator= is private
           mReclaimSnapshot.setSize(mAllBlocks.size());
           if (mAllBlocks.size() > 0) {
@@ -5850,7 +5866,7 @@ public:
    void createFreeList()
    {
       #ifdef HXCPP_GC_CONCURRENT
-      hx::AutoLock lock(mFreeBlockListLock);
+      AutoLock lock(mFreeBlockListLock);
       #endif
 
       mFreeBlocks.clear();
@@ -7382,9 +7398,9 @@ int   __hxcpp_gc_reserved_bytes()
 }
 
 // Return whole-process memory usage, in bytes
-#// - Windows: WorkingSetSize (resident pages, aligns with Task Manager Memory)
-#// - macOS/iOS: mach_task_basic_info.resident_size (RSS)
-#// - Linux/Android: VmRSS from /proc/self/status (fallback to /proc/self/statm)
+// - Windows: WorkingSetSize (resident pages, aligns with Task Manager Memory)
+// - macOS/iOS: mach_task_basic_info.resident_size (RSS)
+// - Linux/Android: VmRSS from /proc/self/status (fallback to /proc/self/statm)
 static size_t __hxcpp_process_used_bytes()
 {
    #ifdef HX_WINDOWS
@@ -7603,4 +7619,42 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
 
 
 void DummyFunction(void *inPtr) { }
+
+#ifdef HXCPP_GC_CONCURRENT
+namespace hx
+{
+   void __hxcpp_gc_start_concurrent_mark_impl() {
+       #ifdef HX_WINDOWS
+       SetConsoleOutputCP(65001); // CP_UTF8
+       #endif
+
+       // COOLDOWN: Don't trigger concurrent GC too frequently!
+       // Default: 0.5s
+       double now = hx::OS::GetTime();
+       if (now - sLastConcurrentGCRequestTime < 0.5)
+       {
+           // printf("[并发GC] 请求过于频繁，忽略。\n");
+           return;
+       }
+       sLastConcurrentGCRequestTime = now;
+
+       printf("[并发GC] __hxcpp_gc_start_concurrent_mark 被调用。请求并发 GC...\n");
+
+       // Trigger a special collect that only does root scanning and starts concurrent marking
+       hx::gConcurrentRequested = true;
+       hx::InternalCollect(true, false); 
+   }
+
+   bool __hxcpp_gc_is_concurrent_marking_impl() {
+      return hx::gConcurrentState == hx::gcStateMarking;
+   }
+
+   void __hxcpp_gc_finish_concurrent_mark_impl() {
+      // Force wait for concurrent marking to finish
+      while(hx::gConcurrentState != hx::gcStateNone) {
+          hx::OS::Sleep(0.001);
+      }
+   }
+}
+#endif
 

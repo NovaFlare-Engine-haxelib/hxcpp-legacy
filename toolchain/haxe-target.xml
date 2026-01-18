@@ -141,6 +141,7 @@
   <depend name="${HXCPP}/src/hx/Unicase.h"/>
   <depend name="${HXCPP}/src/hx/gc/GcRegCapture.h"/>
   <compilerflag value="-D_CRT_SECURE_NO_DEPRECATE"/>
+  <compilerflag value="-DHXCPP_GC_CONCURRENT" if="HXCPP_GC_CONCURRENT" />
 
   <compilerflag value="-DHX_UNDEFINE_H" />
 
@@ -240,5 +241,3 @@
 
 
 </xml>
-
-
