@@ -37,9 +37,6 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES double __hxcpp_gc_mem_info(int inWhat);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_enter_gc_free_zone();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_exit_gc_free_zone();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_safe_point();
-HXCPP_EXTERN_CLASS_ATTRIBUTES void __hxcpp_gc_start_concurrent_mark();
-HXCPP_EXTERN_CLASS_ATTRIBUTES bool __hxcpp_gc_is_concurrent_marking();
-HXCPP_EXTERN_CLASS_ATTRIBUTES void __hxcpp_gc_finish_concurrent_mark();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_spam_collects(int inEveryNCalls);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_working_memory(int inBytes);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_free_space(int inBytes);
@@ -453,21 +450,6 @@ public:
 typedef ImmixAllocator GcAllocator;
 typedef ImmixAllocator Ctx;
 
-
-#ifdef HXCPP_GC_CONCURRENT
-   // Concurrent marking active?
-   HXCPP_EXTERN_CLASS_ATTRIBUTES extern bool gConcurrentMarkingActive;
-
-   #define HX_OBJ_WB_SATB_CTX(obj, old_val, ctx) { \
-       if (hx::gConcurrentMarkingActive && old_val) { \
-           ctx->pushSATB(old_val); \
-       } \
-   }
-#else
-   #define HX_OBJ_WB_SATB_CTX(obj, old_val, ctx)
-#endif
-
-#define HX_OBJ_WB_SATB(obj, old_val) HX_OBJ_WB_SATB_CTX(obj, old_val, _hx_ctx)
 
 #ifdef HXCPP_GC_GENERATIONAL
   #define HX_OBJ_WB_CTX(obj,value,ctx) { \

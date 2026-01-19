@@ -29,11 +29,6 @@ namespace hx
    int gByteMarkID = 0x10;
    int gRememberedByteMarkID = 0x10 | HX_GC_REMEMBERED;
 
-   #ifdef HXCPP_GC_CONCURRENT
-   bool gConcurrentMarkingActive = false;
-   bool gConcurrentRequested = false;
-   #endif
-
 
 int gFastPath = 0;
 int gSlowPath = 0;
@@ -448,54 +443,19 @@ DECLARE_FAST_TLS_DATA(StackContext, tlsStackContext);
 #ifdef HXCPP_SCRIPTABLE
 extern void scriptMarkStack(hx::MarkContext *);
 #endif
-   // Concurrent GC API Implementation
-   #ifdef HXCPP_GC_CONCURRENT
-   static double sLastConcurrentGCRequestTime = 0.0;
-   #endif
-
-    void __hxcpp_gc_start_concurrent_mark_impl();
-    bool __hxcpp_gc_is_concurrent_marking_impl();
-    void __hxcpp_gc_finish_concurrent_mark_impl();
-
-    void __hxcpp_gc_start_concurrent_mark() {
-       // DEBUG: Check if function is called and macro is defined
-       #ifndef HXCPP_GC_CONCURRENT
-       printf("[并发GC] 警告: __hxcpp_gc_start_concurrent_mark 被调用，但 HXCPP_GC_CONCURRENT 宏未定义！并发 GC 未启用。\n");
-       printf("[并发GC] 请在编译参数中添加 -D HXCPP_GC_CONCURRENT\n");
-       #else
-       __hxcpp_gc_start_concurrent_mark_impl();
-       #endif
-    }
-
-   bool __hxcpp_gc_is_concurrent_marking() {
-      #ifdef HXCPP_GC_CONCURRENT
-      return __hxcpp_gc_is_concurrent_marking_impl();
-      #else
-      return false;
-      #endif
-   }
-
-   void __hxcpp_gc_finish_concurrent_mark() {
-      #ifdef HXCPP_GC_CONCURRENT
-      __hxcpp_gc_finish_concurrent_mark_impl();
-      #endif
-   }
-} // end namespace hx
-
-// External C API wrappers
-void __hxcpp_gc_start_concurrent_mark() { hx::__hxcpp_gc_start_concurrent_mark(); }
-bool __hxcpp_gc_is_concurrent_marking() { return hx::__hxcpp_gc_is_concurrent_marking(); }
-void __hxcpp_gc_finish_concurrent_mark() { hx::__hxcpp_gc_finish_concurrent_mark(); }
-
-// ---  Internal GC - IMMIX Implementation ------------------------------
+}
 
 //#define DEBUG_ALLOC_PTR ((char *)0xb68354)
+
 
 #ifdef HX_WINDOWS
 #define ZERO_MEM(ptr, n) ZeroMemory(ptr,n)
 #else
 #define ZERO_MEM(ptr, n) memset(ptr,0,n)
 #endif
+
+
+// ---  Internal GC - IMMIX Implementation ------------------------------
 
 
 
@@ -1467,10 +1427,7 @@ bool BiggestFreeFirst(BlockDataInfo *inA, BlockDataInfo *inB)
 }
 bool SmallestFreeFirst(BlockDataInfo *inA, BlockDataInfo *inB)
 {
-   if (inA->mMaxHoleSize < inB->mMaxHoleSize) return true;
-   if (inA->mMaxHoleSize > inB->mMaxHoleSize) return false;
-   
-   return inA->getUsedRows() > inB->getUsedRows();
+   return inA->mMaxHoleSize < inB->mMaxHoleSize;
 }
 
 
@@ -1628,19 +1585,10 @@ struct GlobalChunks
       return 0;
    }
 
-   // Add a chunk to the list, assuming we are the collector and no one else is running
-   // WARNING: This is NOT thread safe if other threads are running!
-   // In Concurrent GC mode, we must use atomic operations.
    void addLocked(MarkChunk *inChunk)
    {
-      #ifdef HXCPP_GC_CONCURRENT
-      // In concurrent mode, use atomic push to ensure safety
-      if (inChunk)
-         pushJob(inChunk, false);
-      #else
       inChunk->next = (MarkChunk *)processList;
       processList = (volatile MarkChunk *)inChunk;
-      #endif
    }
 
    void copyPointers( QuickVec<hx::Object *> &outPointers,bool andFree=false)
@@ -2680,7 +2628,7 @@ static int localAllocs;
 static int rootObjects;
 static int rootAllocs;
 
-void RunFinalizers(int inMaxCount=-1)
+void RunFinalizers()
 {
    finalizerCount = 0;
 
@@ -2688,23 +2636,9 @@ void RunFinalizers(int inMaxCount=-1)
    int idx = 0;
    while(idx<list.size())
    {
-      if (inMaxCount>0 && finalizerCount>=inMaxCount)
-         break;
-
-      InternalFinalizer *f = 0;
-      {
-         #ifdef HXCPP_GC_CONCURRENT
-         AutoLock lock(*sFinalizerLock);
-         if (idx >= list.size()) break;
-         #endif
-         f = list[idx];
-      }
-
+      InternalFinalizer *f = list[idx];
       if (!f->mValid)
       {
-         #ifdef HXCPP_GC_CONCURRENT
-         AutoLock lock(*sFinalizerLock);
-         #endif
          list.qerase(idx);
          delete f;
       }
@@ -2715,9 +2649,6 @@ void RunFinalizers(int inMaxCount=-1)
             f->mFinalizer(f->mObject);
             finalizerCount++;
          }
-         #ifdef HXCPP_GC_CONCURRENT
-         AutoLock lock(*sFinalizerLock);
-         #endif
          list.qerase(idx);
          delete f;
       }
@@ -3195,26 +3126,6 @@ static int sMaxZeroQueueSize = 32;
 #define BLOCK_OFSIZE_COUNT 12
 
 
-   // Concurrent GC State Machine
-   enum ConcurrentGCState {
-      gcStateNone,
-      gcStateMarking,
-      gcStateSweeping
-   };
-   
-   volatile ConcurrentGCState gConcurrentState = gcStateNone;
-   
-   #ifdef HXCPP_GC_CONCURRENT
-   bool gConcurrentMarkingActive = false;
-   
-   // Flag to indicate that the concurrent thread has found zombies that need processing
-   volatile bool gConcurrentFinalizersPending = false;
-   
-   HxSemaphore gConcurrentSignal;
-   HxSemaphore gSweepFinishedSignal;
-   #endif
-
-
 class GlobalAllocator
 {
    enum { LOCAL_POOL_SIZE = 2 };
@@ -3237,12 +3148,6 @@ public:
 
       createFreeList();
    }
-   // Concurrent GC locks
-   #ifdef HXCPP_GC_CONCURRENT
-   HxMutex mBlockListLock;
-   HxMutex mFreeBlockListLock;
-   #endif
-
    void AddLocal(LocalAllocator *inAlloc)
    {
       if (!gThreadStateChangeLock)
@@ -3327,17 +3232,14 @@ public:
       if (hx::gPauseForCollect)
          __hxcpp_gc_safe_point();
 
+      //Should we force a collect ? - the 'large' data are not considered when allocating objects
+      // from the blocks, and can 'pile up' between smalll object allocations
       if ((inSize+mLargeAllocated > mLargeAllocForceRefresh) && sgInternalEnable)
       {
          #ifdef SHOW_MEM_EVENTS
          //GCLOG("Large alloc causing collection");
          #endif
-         
-         #ifdef HXCPP_GC_CONCURRENT
-         __hxcpp_gc_start_concurrent_mark();
-         #else
          CollectFromThisThread(false,false);
-         #endif
       }
 
       inSize = (inSize +3) & ~3;
@@ -3475,10 +3377,6 @@ public:
    #endif
    BlockDataInfo *GetNextFree(int inRequiredBytes)
    {
-      #ifdef HXCPP_GC_CONCURRENT
-      AutoLock lock(mBlockListLock);
-      #endif
-
       bool failedLock = true;
       int sizeSlot = inRequiredBytes>>IMMIX_LINE_BITS;
       if (sizeSlot>=BLOCK_OFSIZE_COUNT)
@@ -3610,11 +3508,6 @@ public:
       int n = 1<<IMMIX_BLOCK_GROUP_BITS;
 
 
-      // AllocMoreBlocks modifies mAllBlocks and mFreeBlocks.
-      #ifdef HXCPP_GC_CONCURRENT
-      AutoLock lock1(mBlockListLock);
-      #endif
-
       if (!mAllBlocks.safeReserveExtra(n) || !mFreeBlocks.hasExtraCapacity(n))
       {
          outForceCompact = true;
@@ -3674,10 +3567,6 @@ public:
 
    bool allowMoreBlocks()
    {
-      #ifdef HXCPP_GC_CONCURRENT
-      if (gConcurrentState != gcStateNone) return true;
-      #endif
-
       #ifdef HXCPP_GC_GENERATIONAL
       return sGcMode==gcmFull;
       #else
@@ -3723,62 +3612,16 @@ public:
          #endif
 
          bool forceCompact = false;
-         
-         // OVER-ALLOCATION LOGIC:
-         // If concurrent GC is active (gConcurrentState != gcStateNone), we allow the heap to grow
-         // BEYOND sWorkingMemorySize.
-         // This prevents the allocator from hitting the limit and triggering a synchronous STW GC
-         // while the background thread is already working on freeing memory.
-         // We essentially "borrow" memory from the OS to survive the high-allocation burst.
-         bool allowGrowth = !sgInternalEnable || GetWorkingMemory()<sWorkingMemorySize;
-         
-         #ifdef HXCPP_GC_CONCURRENT
-         if (!allowGrowth && gConcurrentState != gcStateNone)
-         {
-             allowGrowth = true;
-         }
-         #endif
-
-         if (!result && allowMoreBlocks() && allowGrowth)
+         if (!result && allowMoreBlocks() && (!sgInternalEnable || GetWorkingMemory()<sWorkingMemorySize))
          {
             if (AllocMoreBlocks(forceCompact,false))
-            {
-               #ifdef HXCPP_GC_CONCURRENT
-               if (gConcurrentFinalizersPending && !hx::gPauseForCollect)
-               {
-                  hx::RunFinalizers(16);
-               }
-               #endif
-
                result = GetNextFree(inRequiredBytes);
-            }
          }
 
          if (!result)
          {
             inAlloc->SetupStackAndCollect(false,forceCompact,true,true);
-            
-            #ifdef HXCPP_GC_CONCURRENT
-            if (gConcurrentMarkingActive || gConcurrentState != gcStateNone)
-            {
-                if (allowMoreBlocks() && AllocMoreBlocks(forceCompact, false))
-                {
-                   result = GetNextFree(inRequiredBytes);
-                }
-                
-                if (!result)
-                {
-                   while (gConcurrentMarkingActive || gConcurrentState != gcStateNone)
-                   {
-                      gSweepFinishedSignal.WaitSeconds(0.001);
-                   }
-                   result = GetNextFree(inRequiredBytes);
-                }
-            }
-            #endif
-
-            if (!result)
-                result = GetNextFree(inRequiredBytes);
+            result = GetNextFree(inRequiredBytes);
          }
 
          if (!result && !forceCompact)
@@ -4477,13 +4320,13 @@ public:
       while(!sgThreadPoolAbort)
       {
          int blockId = _hx_atomic_add(&mThreadJobId, 1);
-         if (blockId>=mReclaimSnapshot.size())
+         if (blockId>=mAllBlocks.size())
             break;
 
          if ( sgThreadPoolJob==tpjReclaimFull)
-            mReclaimSnapshot[blockId]->reclaim<true>(&outStats);
+            mAllBlocks[blockId]->reclaim<true>(&outStats);
          else
-            mReclaimSnapshot[blockId]->reclaim<false>(&outStats);
+            mAllBlocks[blockId]->reclaim<false>(&outStats);
       }
    }
 
@@ -4852,97 +4695,8 @@ public:
    double tMarkLocal;
    double tMarkLocalEnd;
    double tMarked;
-
-   
-   void ConcurrentGCThreadFunc(void *)
+   void MarkAll(bool inGenerational, hx::QuickVec<hx::Object *> *inRememberedSet = 0)
    {
-       #ifdef HXCPP_GC_CONCURRENT
-       while(true)
-       {
-           gConcurrentSignal.Wait();
-           double tStart = __hxcpp_time_stamp();
-           printf("[并发GC] 后台线程 (%lu): 唤醒. 状态: %d\n", GetCurrentThreadId(), gConcurrentState);
-
-           if (gConcurrentState == gcStateMarking)
-           {
-               printf("[并发GC] 后台线程 (%lu): 开始标记...\n", GetCurrentThreadId());
-               double tMarkStart = __hxcpp_time_stamp();
-
-               // Perform concurrent marking
-               #ifdef HX_MULTI_THREAD_MARKING
-               StartThreadJobs(tpjMark, MAX_GC_THREADS, true);
-               #endif
-            
-               {
-                   AutoLock lock(*gSpecialObjectLock);
-                   hx::FindZombies(sGlobalAlloc->mMarker);
-               }
-               
-               if (hx::sZombieList.size() > 0)
-               {
-                   gConcurrentFinalizersPending = true;
-               }
-               
-               double tMarkEnd = __hxcpp_time_stamp();
-               printf("[并发GC] 后台线程 (%lu): 标记完成. 耗时: %.6f 秒\n", GetCurrentThreadId(), tMarkEnd - tMarkStart);
-
-               gConcurrentState = gcStateSweeping;
-           }
-           
-           if (gConcurrentState == gcStateSweeping)
-           {
-               printf("[并发GC] 后台线程 (%lu): 开始清扫...\n", GetCurrentThreadId());
-               double tSweepStart = __hxcpp_time_stamp();
-
-               // Perform concurrent sweeping
-               if (sGlobalAlloc) {
-                   BlockDataStats stats;
-                   
-                   sGlobalAlloc->reclaimBlocks(false, stats);
-
-                   {
-                       AutoLock lock(sGlobalAlloc->mBlockListLock);
-                       
-                       // Try to release empty groups to OS
-                       // This actually reduces MemReserved (system memory usage)
-                       BlockDataStats releaseStats;
-                       // Try to release up to 64MB per GC cycle
-                       sGlobalAlloc->releaseEmptyGroups(releaseStats, 64*1024*1024);
-                       
-                       sGlobalAlloc->createFreeList();
-                       
-                       // UPDATE GLOBAL STATS
-                       // Without this, the allocator thinks memory is still full!
-                       sGlobalAlloc->mRowsInUse = stats.rowsInUse;
-                       sGlobalAlloc->mCurrentRowsInUse = stats.rowsInUse;
-                       // Also update block count stats since releaseEmptyGroups might have reduced it
-                       sGlobalAlloc->mAllBlocksCount = sGlobalAlloc->mAllBlocks.size();
-                       
-                       // Trigger background zeroing
-                       sGlobalAlloc->backgroundProcessFreeList(true);
-                   }
-               }
-               
-               // Signal completion
-               gConcurrentState = gcStateNone;
-               
-               #ifdef HXCPP_GC_CONCURRENT
-               gConcurrentMarkingActive = false;
-               gSweepFinishedSignal.Set();
-               #endif
-
-               double tSweepEnd = __hxcpp_time_stamp();
-               printf("[并发GC] 后台线程 (%lu): 清扫完成. 耗时: %.6f 秒\n", GetCurrentThreadId(), tSweepEnd - tSweepStart);
-               printf("[并发GC] 后台线程 (%lu): 周期结束. 总耗时 (从唤醒开始): %.6f 秒\n", GetCurrentThreadId(), tSweepEnd - tStart);
-           }
-       }
-       #endif
-   }
-
-   void MarkAll(bool inGenerational)
-   {
-      // MOVED: Concurrent check is now done AFTER root marking
-      
       if (!inGenerational)
       {
          hx::gPrevByteMarkID = hx::gByteMarkID;
@@ -5031,26 +4785,24 @@ public:
          hx::MarkObjectAlloc(hx::sZombieList[i] , &mMarker );
       } // automark
 
-      // Mark local stacks - MUST be done before resuming threads in concurrent mode!
       MEM_STAMP(tMarkLocal);
       hx::localCount = 0;
 
       mMarker.isGenerational = inGenerational;
 
+      // Mark local stacks
       for(int i=0;i<mLocalAllocs.size();i++)
          MarkLocalAlloc(mLocalAllocs[i] , &mMarker);
 
-      #ifdef HXCPP_GC_CONCURRENT
-      if (gConcurrentMarkingActive && !inGenerational)
+      if (inRememberedSet)
       {
-          // Concurrent marking path - Trigger AFTER roots and stacks are marked
-          printf("[并发GC] 主线程 (%lu): 根对象标记完成. 移交给后台线程.\n", GetCurrentThreadId());
-          gConcurrentState = gcStateMarking;
-          gConcurrentSignal.Set();
-         
-          return;
+         for(int i=0;i<inRememberedSet->size();i++)
+         {
+            hx::Object *obj = (*inRememberedSet)[i];
+            if (obj)
+               mMarker.pushObj(obj);
+         }
       }
-      #endif
 
       #ifdef PROFILE_COLLECT
       hx::localObjects = sObjectMarks;
@@ -5197,61 +4949,22 @@ public:
 
       #ifdef HXCPP_GC_GENERATIONAL
       bool compactSurviors = false;
-      #endif
 
-      for(int i=0;i<mLocalAllocs.size();i++)
+      if (sGcMode==gcmGenerational)
       {
-         hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
-
-         #ifdef HXCPP_GC_GENERATIONAL
-         if (sGcMode==gcmGenerational)
+         for(int i=0;i<mLocalAllocs.size();i++)
          {
-            if( ctx->mOldReferrers && ctx->mOldReferrers->count )
+            hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
+            if( ctx->mOldReferrers->count )
                 hx::sGlobalChunks.addLocked( ctx->mOldReferrers );
-            else if (ctx->mOldReferrers)
+            else
                 hx::sGlobalChunks.free( ctx->mOldReferrers );
             ctx->mOldReferrers = 0;
          }
-         #endif
-
-         #ifdef HXCPP_GC_CONCURRENT
-         if( ctx->mSATBBuffer )
-         {
-             if (ctx->mSATBBuffer->count)
-                hx::sGlobalChunks.addLocked( ctx->mSATBBuffer );
-             else
-                hx::sGlobalChunks.free( ctx->mSATBBuffer );
-             ctx->mSATBBuffer = 0;
-         }
-         #endif
       }
 
-      #ifdef HXCPP_GC_GENERATIONAL
       hx::QuickVec<hx::Object *> rememberedSet;
       generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
-      
-      #ifdef HXCPP_GC_CONCURRENT
-      if (!generational && !inForceCompact)
-      {
-          if (gConcurrentState != gcStateNone || gConcurrentMarkingActive)
-          {
-             // Do not wait - try to alloc more blocks instead
-             sgIsCollecting = false;
-             #ifndef HXCPP_SINGLE_THREADED_APP
-             if (!inLocked)
-                gThreadStateChangeLock->Unlock();
-             for(int i=0;i<mLocalAllocs.size();i++)
-                if (mLocalAllocs[i]!=this_local)
-                   ReleaseFromSafe(mLocalAllocs[i]);
-             #endif
-             _hx_atomic_exchange(&hx::gPauseForCollect, 0);
-             return;
-          }
-          
-          hx::gConcurrentRequested = true;
-      }
-      #endif
-
       if (sGcMode==gcmGenerational)
       {
          hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
@@ -5265,72 +4978,7 @@ public:
 
       STAMP(t1)
 
-      #ifdef HXCPP_GC_CONCURRENT
-      static bool sConcurrentThreadStarted = false;
-      if (!sConcurrentThreadStarted)
-      {
-          hx::HxCreateDetachedThread(ConcurrentGCThreadFunc, 0);
-          sConcurrentThreadStarted = true;
-      }
-      
-       if (hx::gConcurrentRequested && !inForceCompact)
-       {
-           generational = false;
-       }
-       
-       if (!generational && !inForceCompact)
-       {
-           // Force concurrent request if we are doing a full GC
-           if (gConcurrentState == gcStateNone || hx::gConcurrentRequested)
-               hx::gConcurrentRequested = true;
-       }
-
-       if (!generational && !inForceCompact && hx::gConcurrentRequested)
-       {
-           if (gConcurrentFinalizersPending)
-           {
-               hx::RunFinalizers();
-               gConcurrentFinalizersPending = false;
-           }
-       
-           gConcurrentMarkingActive = true;
-           printf("[并发GC] 主线程 (%lu): 请求并发 GC. 开始根对象标记...\n", GetCurrentThreadId());
-           hx::gConcurrentRequested = false;
-           // Thread is already started above
-           if (gConcurrentState == gcStateNone)
-           {
-              // Just ensure it's running (it should be waiting on signal)
-           }
-       }
-       #endif
-
-      MarkAll(generational);
-
-      #ifdef HXCPP_GC_CONCURRENT
-      if (gConcurrentMarkingActive)
-      {
-          sgIsCollecting = false;
-          // Release locks and resume threads
-           #ifndef HXCPP_SINGLE_THREADED_APP
-           if (!inLocked)
-              gThreadStateChangeLock->Unlock();
-           for(int i=0;i<mLocalAllocs.size();i++)
-              if (mLocalAllocs[i]!=this_local)
-                 ReleaseFromSafe(mLocalAllocs[i]);
-           #endif
-           
-           // Clear the global pause flag so others can run
-           _hx_atomic_exchange(&hx::gPauseForCollect, 0);
-           
-           #ifdef HXCPP_GC_MOVING
-           sgTimeToNextTableUpdate = 7;
-           #else
-           sgTimeToNextTableUpdate = 15;
-           #endif
-           
-           return; 
-      }
-      #endif
+      MarkAll(generational, &rememberedSet);
 
       #ifdef HX_GC_VERIFY_GENERATIONAL
       {
@@ -5350,17 +4998,14 @@ public:
       STAMP(t2)
 
 
+      // Sweep blocks
 
+      // Update table entries?  This needs to be done before the gMarkID count clocks
+      //  back to the same number
       if (!generational)
-      {
          sgTimeToNextTableUpdate--;
-      }
 
-      #ifdef HXCPP_GC_CONCURRENT
-      bool full = inMajor || inForceCompact;
-      #else
       bool full = inMajor || (sgTimeToNextTableUpdate<=0) || inForceCompact;
-      #endif
 
       // Setup memory target ...
       // Count free rows, and prep blocks for sorting
@@ -5375,7 +5020,7 @@ public:
          countRows(stats);
          size_t currentRows = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
          double filled = (double)(currentRows) / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
-         if (filled>0.92)
+         if (filled>0.85)
          {
             // Failure of generational estimation
             int retained = currentRows - mRowsInUse;
@@ -5427,14 +5072,12 @@ public:
          // Could be either expanding, or fragmented...
          if (useRatio>0.75)
          {
-            #ifndef HXCPP_GC_CONCURRENT
             #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
                GCLOG("Do full stats\n", useRatio);
             #endif
             full = true;
             stats.clear();
             reclaimBlocks(full,stats);
-            #endif
          }
       }
       #endif
@@ -5790,54 +5433,25 @@ public:
 
    void reclaimBlocks(bool full, BlockDataStats &outStats)
    {
-      #ifdef HXCPP_GC_CONCURRENT
-      if (gConcurrentState != gcStateNone)
-      {
-          AutoLock lock(mBlockListLock);
-          // Manually copy the vector since operator= is private
-          mReclaimSnapshot.setSize(mAllBlocks.size());
-          if (mAllBlocks.size() > 0) {
-              memcpy(mReclaimSnapshot.mPtr, mAllBlocks.mPtr, mAllBlocks.size() * sizeof(BlockDataInfo *));
-          }
-      }
-      else
-      {
-          // Manually copy the vector since operator= is private
-          mReclaimSnapshot.setSize(mAllBlocks.size());
-          if (mAllBlocks.size() > 0) {
-              memcpy(mReclaimSnapshot.mPtr, mAllBlocks.mPtr, mAllBlocks.size() * sizeof(BlockDataInfo *));
-          }
-      }
-      #else
-      // Manually copy the vector since operator= is private
-      mReclaimSnapshot.setSize(mAllBlocks.size());
-      if (mAllBlocks.size() > 0) {
-          memcpy(mReclaimSnapshot.mPtr, mAllBlocks.mPtr, mAllBlocks.size() * sizeof(BlockDataInfo *));
-      }
-      #endif
-
       if (MAX_GC_THREADS>1)
       {
          for(int i=0;i<MAX_GC_THREADS;i++)
             sThreadBlockDataStats[i].clear();
-         StartThreadJobs(full ? tpjReclaimFull : tpjReclaim, mReclaimSnapshot.size(), true);
+         StartThreadJobs(full ? tpjReclaimFull : tpjReclaim, mAllBlocks.size(), true);
          outStats = sThreadBlockDataStats[0];
          for(int i=1;i<MAX_GC_THREADS;i++)
             outStats.add(sThreadBlockDataStats[i]);
-         
-         mReclaimSnapshot.clear();
       }
       else
       {
          outStats.clear();
-         for(int i=0;i<mReclaimSnapshot.size();i++)
+         for(int i=0;i<mAllBlocks.size();i++)
          {
             if (full)
-               mReclaimSnapshot[i]->reclaim<true>(&outStats);
+               mAllBlocks[i]->reclaim<true>(&outStats);
             else
-               mReclaimSnapshot[i]->reclaim<false>(&outStats);
+               mAllBlocks[i]->reclaim<false>(&outStats);
          }
-         mReclaimSnapshot.clear();
       }
    }
 
@@ -5865,10 +5479,6 @@ public:
    // buils mFreeBlocks and maybe starts the async-zero process on mZeroList
    void createFreeList()
    {
-      #ifdef HXCPP_GC_CONCURRENT
-      AutoLock lock(mFreeBlockListLock);
-      #endif
-
       mFreeBlocks.clear();
 
       for(int i=0;i<mAllBlocks.size();i++)
@@ -6022,7 +5632,6 @@ public:
    volatile int mThreadJobId;
 
    BlockList mAllBlocks;
-   BlockList mReclaimSnapshot;
    BlockList mFreeBlocks;
    BlockList mZeroList;
    volatile int mZeroListQueue;
@@ -7398,9 +7007,9 @@ int   __hxcpp_gc_reserved_bytes()
 }
 
 // Return whole-process memory usage, in bytes
-// - Windows: WorkingSetSize (resident pages, aligns with Task Manager Memory)
-// - macOS/iOS: mach_task_basic_info.resident_size (RSS)
-// - Linux/Android: VmRSS from /proc/self/status (fallback to /proc/self/statm)
+#// - Windows: WorkingSetSize (resident pages, aligns with Task Manager Memory)
+#// - macOS/iOS: mach_task_basic_info.resident_size (RSS)
+#// - Linux/Android: VmRSS from /proc/self/status (fallback to /proc/self/statm)
 static size_t __hxcpp_process_used_bytes()
 {
    #ifdef HX_WINDOWS
@@ -7619,42 +7228,4 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
 
 
 void DummyFunction(void *inPtr) { }
-
-#ifdef HXCPP_GC_CONCURRENT
-namespace hx
-{
-   void __hxcpp_gc_start_concurrent_mark_impl() {
-       #ifdef HX_WINDOWS
-       SetConsoleOutputCP(65001); // CP_UTF8
-       #endif
-
-       // COOLDOWN: Don't trigger concurrent GC too frequently!
-       // Default: 0.5s
-       double now = hx::OS::GetTime();
-       if (now - sLastConcurrentGCRequestTime < 0.5)
-       {
-           // printf("[并发GC] 请求过于频繁，忽略。\n");
-           return;
-       }
-       sLastConcurrentGCRequestTime = now;
-
-       printf("[并发GC] __hxcpp_gc_start_concurrent_mark 被调用。请求并发 GC...\n");
-
-       // Trigger a special collect that only does root scanning and starts concurrent marking
-       hx::gConcurrentRequested = true;
-       hx::InternalCollect(true, false); 
-   }
-
-   bool __hxcpp_gc_is_concurrent_marking_impl() {
-      return hx::gConcurrentState == hx::gcStateMarking;
-   }
-
-   void __hxcpp_gc_finish_concurrent_mark_impl() {
-      // Force wait for concurrent marking to finish
-      while(hx::gConcurrentState != hx::gcStateNone) {
-          hx::OS::Sleep(0.001);
-      }
-   }
-}
-#endif
 

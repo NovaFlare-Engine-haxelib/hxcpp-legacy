@@ -188,10 +188,6 @@ String FormatStack(const char *file, const char *clazz, const char *func, int li
 
 StackContext::StackContext()
 {
-   #ifdef HXCPP_GC_CONCURRENT
-   mSATBBuffer = 0;
-   #endif
-
    #ifdef HXCPP_STACK_TRACE
    mIsUnwindingException = false;
    #endif
