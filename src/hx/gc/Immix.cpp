@@ -21,6 +21,41 @@
 #include <unistd.h>
 #endif
 
+// Optimization headers
+#if defined(_MSC_VER)
+   #include <intrin.h>
+#endif
+#if defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2) || defined(_M_X64)
+   #include <emmintrin.h>
+   #define HX_USE_SSE2
+#endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+   #include <arm_neon.h>
+   #define HX_USE_NEON
+#endif
+
+// Bit scan helpers
+#ifdef _MSC_VER
+   #pragma intrinsic(_BitScanForward)
+   static inline int hx_ctz(unsigned int x) {
+      unsigned long r;
+      _BitScanForward(&r, x);
+      return (int)r;
+   }
+#else
+   #define hx_ctz __builtin_ctz
+#endif
+
+// Prefetch helper
+#if defined(__GNUC__) || defined(__clang__)
+   #define HX_PREFETCH(ptr) __builtin_prefetch(ptr)
+#elif defined(_MSC_VER)
+   #define HX_PREFETCH(ptr) _mm_prefetch((char*)(ptr), _MM_HINT_T0)
+#else
+   #define HX_PREFETCH(ptr)
+#endif
+
 
 static bool sgIsCollecting = false;
 
@@ -941,48 +976,55 @@ struct BlockDataInfo
    void countRows(BlockDataStats &outStats)
    {
       unsigned char *rowMarked = mPtr->mRowMarked;
-      unsigned int *rowTotals = ((unsigned int *)rowMarked) + 1;
-
-      // TODO - sse/neon
-      #ifdef HXCPP_GC_BIG_BLOCKS
       unsigned int total = 0;
+
+      #ifdef HX_USE_SSE2
+         __m128i sum = _mm_setzero_si128();
+         __m128i zero = _mm_setzero_si128();
+         
+         int r = IMMIX_HEADER_LINES;
+         // Process 16 bytes at a time
+         for (; r <= IMMIX_LINES - 16; r += 16)
+         {
+            __m128i v = _mm_loadu_si128((__m128i*)(rowMarked + r));
+            sum = _mm_add_epi64(sum, _mm_sad_epu8(v, zero));
+         }
+         
+         // Extract sum
+          // Generic extraction for all platforms to ensure compatibility
+          unsigned long long tmp[2];
+          _mm_storeu_si128((__m128i*)tmp, sum);
+          total = (unsigned int)(tmp[0] + tmp[1]);
+
+         // Finish remainder
+         for (; r < IMMIX_LINES; r++)
+            total += rowMarked[r];
+      #elif defined(HX_USE_NEON)
+         uint32x4_t sum = vdupq_n_u32(0);
+         
+         int r = IMMIX_HEADER_LINES;
+         // Process 16 bytes at a time
+         for (; r <= IMMIX_LINES - 16; r += 16)
+         {
+            uint8x16_t v = vld1q_u8(rowMarked + r);
+            // vpaddlq_u8: pairwise add 8-bit to 16-bit (8x16)
+            // vpadalq_u16: pairwise add 16-bit and accumulate to 32-bit (4x32)
+            sum = vpadalq_u16(sum, vpaddlq_u8(v));
+         }
+         
+         // Horizontal sum of the 4x32 vector
+         // Reduce to 2x32
+         uint64x2_t sum64 = vpaddlq_u32(sum);
+         // Reduce to scalar
+         total = vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1);
+
+         // Finish remainder
+         for (; r < IMMIX_LINES; r++)
+            total += rowMarked[r];
       #else
-      unsigned int total = rowMarked[2] + rowMarked[3];
-      #endif
-
-      total +=
-       rowTotals[0]  + rowTotals[1]  + rowTotals[2]  + rowTotals[3]  + rowTotals[4] +
-       rowTotals[5]  + rowTotals[6]  + rowTotals[7]  + rowTotals[8]  + rowTotals[9] +
-       rowTotals[10] + rowTotals[11] + rowTotals[12] + rowTotals[13] + rowTotals[14] +
-       rowTotals[15] + rowTotals[16] + rowTotals[17] + rowTotals[18] + rowTotals[19] +
-       rowTotals[20] + rowTotals[21] + rowTotals[22] + rowTotals[23] + rowTotals[24] +
-       rowTotals[25] + rowTotals[26] + rowTotals[27] + rowTotals[28] + rowTotals[29] +
-       rowTotals[30] + rowTotals[31] + rowTotals[32] + rowTotals[33] + rowTotals[34] +
-       rowTotals[35] + rowTotals[36] + rowTotals[37] + rowTotals[38] + rowTotals[39] +
-       rowTotals[40] + rowTotals[41] + rowTotals[42] + rowTotals[43] + rowTotals[44] +
-       rowTotals[45] + rowTotals[46] + rowTotals[47] + rowTotals[48] + rowTotals[49] +
-       rowTotals[50] + rowTotals[51] + rowTotals[52] + rowTotals[53] + rowTotals[54] +
-       rowTotals[55] + rowTotals[56] + rowTotals[57] + rowTotals[58] + rowTotals[59] +
-       rowTotals[60] + rowTotals[61] + rowTotals[62];
-
-
-      #ifdef HXCPP_GC_BIG_BLOCKS
-      rowTotals += 63;
-      total +=
-       rowTotals[0]  + rowTotals[1]  + rowTotals[2]  + rowTotals[3]  + rowTotals[4] +
-       rowTotals[5]  + rowTotals[6]  + rowTotals[7]  + rowTotals[8]  + rowTotals[9] +
-       rowTotals[10] + rowTotals[11] + rowTotals[12] + rowTotals[13] + rowTotals[14] +
-       rowTotals[15] + rowTotals[16] + rowTotals[17] + rowTotals[18] + rowTotals[19] +
-       rowTotals[20] + rowTotals[21] + rowTotals[22] + rowTotals[23] + rowTotals[24] +
-       rowTotals[25] + rowTotals[26] + rowTotals[27] + rowTotals[28] + rowTotals[29] +
-       rowTotals[30] + rowTotals[31] + rowTotals[32] + rowTotals[33] + rowTotals[34] +
-       rowTotals[35] + rowTotals[36] + rowTotals[37] + rowTotals[38] + rowTotals[39] +
-       rowTotals[40] + rowTotals[41] + rowTotals[42] + rowTotals[43] + rowTotals[44] +
-       rowTotals[45] + rowTotals[46] + rowTotals[47] + rowTotals[48] + rowTotals[49] +
-       rowTotals[50] + rowTotals[51] + rowTotals[52] + rowTotals[53] + rowTotals[54] +
-       rowTotals[55] + rowTotals[56] + rowTotals[57] + rowTotals[58] + rowTotals[59] +
-       rowTotals[60] + rowTotals[61] + rowTotals[62] + rowTotals[63];
-
+         // Simple loop fallback - compiler will auto-vectorize or unroll
+         for(int r = IMMIX_HEADER_LINES; r<IMMIX_LINES; r++)
+             total += rowMarked[r];
       #endif
 
       mUsedRows = (total & 0xff) + ((total>>8) & 0xff) + ((total>>16)&0xff) + ((total>>24)&0xff);
@@ -1071,38 +1113,22 @@ struct BlockDataInfo
                   if (starts)
                   {
                      unsigned int *headerPtr = ((unsigned int *)mPtr->mRow[r]);
-                     #define CHECK_FLAG(i,byteMask) \
-                     { \
-                        unsigned int mask = 1<<i; \
-                        if ( starts & mask ) \
-                        { \
-                           unsigned int header = headerPtr[i]; \
-                           if ( (header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID ) \
-                           { \
-                              starts ^= mask; \
-                              if (!(starts & byteMask)) \
-                                 break; \
-                           } \
-                           else \
-                              usedBytes += sizeof(int) + ((header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT); \
-                        } \
+                     unsigned int bits = starts;
+                     while(bits)
+                     {
+                        int i = hx_ctz(bits);
+                        unsigned int mask = 1<<i;
+                        unsigned int header = headerPtr[i];
+
+                        if ( (header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
+                        {
+                           starts ^= mask;
+                        }
+                        else
+                           usedBytes += sizeof(int) + ((header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT);
+                        
+                        bits ^= mask;
                      }
-
-                     if (starts & 0x000000ff)
-                        for(int i=0;i<8;i++)
-                           CHECK_FLAG(i,0x000000ff);
-
-                     if (starts & 0x0000ff00)
-                        for(int i=8;i<16;i++)
-                           CHECK_FLAG(i,0x0000ff00);
-
-                     if (starts & 0x00ff0000)
-                        for(int i=16;i<24;i++)
-                           CHECK_FLAG(i,0x00ff0000);
-
-                     if (starts & 0xff000000)
-                        for(int i=24;i<32;i++)
-                           CHECK_FLAG(i,0xff000000);
                   }
                }
                r++;
@@ -1959,6 +1985,9 @@ public:
              hx::Object *obj = marking->pop();
              if (obj)
              {
+                if (marking->count)
+                   HX_PREFETCH(marking->stack[marking->count-1]);
+
                 obj->__Mark(this);
                 #if HX_MULTI_THREAD_MARKING
                 // Load balance
