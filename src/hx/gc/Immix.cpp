@@ -47,13 +47,34 @@
    #define hx_ctz __builtin_ctz
 #endif
 
+
+
+
 // Prefetch helper
 #if defined(__GNUC__) || defined(__clang__)
    #define HX_PREFETCH(ptr) __builtin_prefetch(ptr)
+   #define HX_LIKELY(x) __builtin_expect(!!(x), 1)
+   #define HX_UNLIKELY(x) __builtin_expect(!!(x), 0)
+
+   #if defined(__i386__) || defined(__x86_64__)
+     #include <immintrin.h>
+     #define HX_SPIN_PAUSE() _mm_pause()
+   #else
+     #define HX_SPIN_PAUSE()
+   #endif
+
 #elif defined(_MSC_VER)
    #define HX_PREFETCH(ptr) _mm_prefetch((char*)(ptr), _MM_HINT_T0)
+   #define HX_LIKELY(x) (x)
+   #define HX_UNLIKELY(x) (x)
+
+   #include <intrin.h>
+   #define HX_SPIN_PAUSE() _mm_pause()
 #else
    #define HX_PREFETCH(ptr)
+   #define HX_LIKELY(x) (x)
+   #define HX_UNLIKELY(x) (x)
+   #define HX_SPIN_PAUSE()
 #endif
 
 
@@ -164,8 +185,9 @@ static size_t sgMaximumFreeSpace  = 1024*1024*1024;
 static size_t sgMaximumFreeSpace  = 1024*1024*1024;
 #endif
 
+//#define PROFILE_THREAD_USAGE
 
-// #define HXCPP_GC_DEBUG_LEVEL 1
+//#define HXCPP_GC_DEBUG_LEVEL 0
 
 #if HXCPP_GC_DEBUG_LEVEL>1
   #define PROFILE_COLLECT
@@ -660,6 +682,7 @@ enum ThreadPoolJob
    tpjVisitBlocks,
    tpjMoveBlocks,
    tpjCleanWeakRefs,
+   tpjClearRowMarks,
 };
 
 int sgThreadCount = 0;
@@ -1558,8 +1581,35 @@ struct MarkInfo
    const char *mMember;
 };
 
+struct WorkStealingQueue
+{
+   MarkChunk * head;
+   volatile int lock;
+
+   WorkStealingQueue() : head(0), lock(0) { }
+
+   void push(MarkChunk *c)
+   {
+      while(_hx_atomic_compare_exchange(&lock, 0, 1) != 0) HX_SPIN_PAUSE();
+      c->next = head;
+      head = c;
+      lock = 0;
+   }
+
+   MarkChunk *pop()
+   {
+      if (!head) return 0;
+      while(_hx_atomic_compare_exchange(&lock, 0, 1) != 0) HX_SPIN_PAUSE();
+      MarkChunk *c = head;
+      if (c) head = c->next;
+      lock = 0;
+      return c;
+   }
+};
+
 struct GlobalChunks
 {
+   WorkStealingQueue threadQueues[MAX_GC_THREADS];
    volatile MarkChunk *processList;
    volatile int       processListPopLock;
    volatile MarkChunk *freeList;
@@ -1586,8 +1636,11 @@ struct GlobalChunks
       return alloc();
    }
 
-   MarkChunk *pushJob(MarkChunk *inChunk,bool inAndAlloc)
+   MarkChunk *pushJob(MarkChunk *inChunk,bool inAndAlloc, int inThreadId = -1)
    {
+      if (inThreadId >= 0 && inThreadId < MAX_GC_THREADS)
+         threadQueues[inThreadId].push(inChunk);
+      else
       while(true)
       {
          MarkChunk *head = (MarkChunk *)processList;
@@ -1633,6 +1686,9 @@ struct GlobalChunks
       int size = 0;
       for(MarkChunk *c =(MarkChunk *)processList; c; c=c->next )
          size += c->count;
+      for(int i=0;i<MAX_GC_THREADS;i++)
+         for(MarkChunk *c = threadQueues[i].head; c; c=c->next)
+             size += c->count;
 
       outPointers.setSize(size);
       int idx = 0;
@@ -1649,6 +1705,17 @@ struct GlobalChunks
             c->next = (MarkChunk *)freeList;
             freeList = c;
          }
+         for(int t=0;t<MAX_GC_THREADS;t++)
+         {
+             while(true) {
+                 MarkChunk *c = threadQueues[t].pop();
+                 if (!c) break;
+                 for(int i=0;i<c->count;i++) outPointers[idx++] = c->stack[i];
+                 c->count = 0;
+                 c->next = (MarkChunk *)freeList;
+                 freeList = c;
+             }
+         }
       }
       else
       {
@@ -1656,6 +1723,12 @@ struct GlobalChunks
          {
             for(int i=0;i<c->count;i++)
                outPointers[idx++] = c->stack[i];
+         }
+         for(int t=0;t<MAX_GC_THREADS;t++)
+         {
+            for(MarkChunk *c = threadQueues[t].head; c; c=c->next)
+               for(int i=0;i<c->count;i++)
+                  outPointers[idx++] = c->stack[i];
          }
       }
    }
@@ -1703,6 +1776,7 @@ struct GlobalChunks
       while(_hx_atomic_compare_exchange(&processListPopLock, 0, 1) != 0)
       {
          // Spin
+         HX_SPIN_PAUSE();
          #ifdef PROFILE_THREAD_USAGE
          _hx_atomic_add(&sSpinCount, 1);
          #endif
@@ -1751,13 +1825,33 @@ struct GlobalChunks
       #ifdef HX_MULTI_THREAD_MARKING
       if (sAllThreads)
       {
-         MarkChunk *result =  popJobLocked(inChunk);
+         if (inChunk) {
+            release(inChunk);
+            inChunk = 0;
+         }
+
+         if (inThreadId >= 0 && inThreadId < MAX_GC_THREADS)
+         {
+             MarkChunk *result = threadQueues[inThreadId].pop();
+             if (result) return result;
+         }
+
+         MarkChunk *result =  popJobLocked(0);
          if (!result)
          {
             for(int spinCount = 0; spinCount<10000; spinCount++)
             {
+               HX_SPIN_PAUSE();
                if ( sgThreadPoolAbort || sAllThreads == ((unsigned long long)1<<inThreadId) )
                   break;
+
+               for(int i=0; i<sgThreadCount; i++) {
+                   int victim = (inThreadId + i + 1) % sgThreadCount;
+                   if (victim == inThreadId) continue;
+                   result = threadQueues[victim].pop();
+                   if (result) return result;
+               }
+
                if (processList)
                {
                   result =  popJobLocked(0);
@@ -1786,6 +1880,7 @@ struct GlobalChunks
       while(_hx_atomic_compare_exchange(&freeListPopLock, 0, 1) != 0)
       {
          // Spin
+         HX_SPIN_PAUSE();
          #ifdef PROFILE_THREAD_USAGE
          _hx_atomic_add(&sSpinCount, 1);
          #endif
@@ -1928,7 +2023,7 @@ public:
        }
        else
        {
-          marking = sGlobalChunks.pushJob(marking,true);
+          marking = sGlobalChunks.pushJob(marking,true,mThreadId);
           marking->push(inObject);
        }
     }
@@ -1943,7 +2038,7 @@ public:
     {
        if (marking && marking->count)
        {
-          sGlobalChunks.pushJob(marking,false);
+          sGlobalChunks.pushJob(marking,false,mThreadId);
        }
        else if (marking)
        {
@@ -1982,23 +2077,76 @@ public:
 
           while(marking)
           {
-             hx::Object *obj = marking->pop();
-             if (obj)
+             // Batch process
+             while(marking && marking->count>=8)
              {
-                if (marking->count)
-                   HX_PREFETCH(marking->stack[marking->count-1]);
+                 int count = marking->count;
+                 hx::Object **stack = marking->stack;
+                 hx::Object *o0 = stack[count-1];
+                 hx::Object *o1 = stack[count-2];
+                 hx::Object *o2 = stack[count-3];
+                 hx::Object *o3 = stack[count-4];
+                 hx::Object *o4 = stack[count-5];
+                 hx::Object *o5 = stack[count-6];
+                 hx::Object *o6 = stack[count-7];
+                 hx::Object *o7 = stack[count-8];
+                 marking->count = count - 8;
 
-                obj->__Mark(this);
-                #if HX_MULTI_THREAD_MARKING
-                // Load balance
-                if (sLazyThreads && marking->count>32)
-                {
-                   MarkChunk *c = sGlobalChunks.alloc();
-                   marking->count -= 16;
-                   c->count = 16;
-                   memcpy( c->stack, marking->stack + marking->count, 16*sizeof(hx::Object *));
-                   sGlobalChunks.pushJob(c,false);
+                 HX_PREFETCH(o0);
+                 HX_PREFETCH(o1);
+                 HX_PREFETCH(o2);
+                 HX_PREFETCH(o3);
+                 HX_PREFETCH(o4);
+                 HX_PREFETCH(o5);
+                 HX_PREFETCH(o6);
+                 HX_PREFETCH(o7);
+
+                 o0->__Mark(this);
+                 o1->__Mark(this);
+                 o2->__Mark(this);
+                 o3->__Mark(this);
+                 o4->__Mark(this);
+                 o5->__Mark(this);
+                 o6->__Mark(this);
+                 o7->__Mark(this);
+
+                 #if HX_MULTI_THREAD_MARKING
+                 #ifdef PROFILE_THREAD_USAGE
+                 sThreadMarkCount[mThreadId]+=8;
+                 #endif
+                 // Load balance
+                 // Check every 8 objects to reduce overhead
+                 if (sLazyThreads && marking->count > 64)
+                 {
+                    MarkChunk *c = sGlobalChunks.alloc();
+                    int half = marking->count >> 1;
+                    marking->count -= half;
+                    c->count = half;
+                    memcpy( c->stack, marking->stack + marking->count, half*sizeof(hx::Object *));
+                   sGlobalChunks.pushJob(c,false,mThreadId);
                 }
+                #endif
+            }
+
+            hx::Object *obj = marking->pop();
+            if (obj)
+            {
+               if (marking->count)
+                  HX_PREFETCH(marking->stack[marking->count-1]);
+
+               obj->__Mark(this);
+               #if HX_MULTI_THREAD_MARKING
+               // Load balance
+               // Check every 4 objects to reduce overhead
+               if (sLazyThreads && (marking->count & 3) == 0 && marking->count > 16)
+               {
+                  MarkChunk *c = sGlobalChunks.alloc();
+                  int half = marking->count >> 1;
+                  marking->count -= half;
+                  c->count = half;
+                  memcpy( c->stack, marking->stack + marking->count, half*sizeof(hx::Object *));
+                  sGlobalChunks.pushJob(c,false,mThreadId);
+               }
                 #ifdef PROFILE_THREAD_USAGE
                 sThreadMarkCount[mThreadId]++;
                 #endif
@@ -2088,6 +2236,10 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
    size_t ptr_i = ((size_t)inPtr)-sizeof(int);
    unsigned int flags =  *((unsigned int *)ptr_i);
 
+   // Check if already marked with current ID to avoid redundant processing
+   if ((flags & IMMIX_ALLOC_MARK_ID) == gMarkID)
+      return;
+
    #ifdef HXCPP_GC_NURSERY
    if (!(flags & 0xff000000))
    {
@@ -2115,9 +2267,7 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
                                           gMarkID;
 
          unsigned int *pos = info->allocStart + startRow;
-         unsigned int val = *pos;
-         while(_hx_atomic_compare_exchange((volatile int *)pos, val,val|gImmixStartFlag[start&127]) != val)
-            val = *pos;
+         _hx_atomic_or((volatile int *)pos, gImmixStartFlag[start&127]);
 
          #ifdef HXCPP_GC_GENERATIONAL
          info->mHasSurvivor = true;
@@ -2220,18 +2370,25 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
       if ( ((ptr_i & IMMIX_BLOCK_OFFSET_MASK)>>IMMIX_LINE_BITS) + rows > IMMIX_LINES) DebuggerTrap();
       #endif
 
-      *rowMark = 1;
+      // Avoid write if already marked to reduce cache traffic (False Sharing)
+      if (!*rowMark)
+         *rowMark = 1;
+      
       if (rows>1)
       {
-         rowMark[1] = 1;
-         if (rows>2)
+         if (rows > 4)
          {
-            rowMark[2] = 1;
-            if (rows>3)
+            // Use memset for larger runs
+            memset(rowMark + 1, 1, rows - 1);
+         }
+         else
+         {
+            rowMark[1] = 1;
+            if (rows>2)
             {
-               rowMark[3] = 1;
-               for(int r=4; r<rows; r++)
-                  rowMark[r]=1;
+               rowMark[2] = 1;
+               if (rows>3)
+                  rowMark[3] = 1;
             }
          }
       }
@@ -2300,8 +2457,12 @@ void MarkObjectArray(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx)
 
 
    #define MARK_PTR_I \
+   HX_PREFETCH(ptrI + 8); \
    tmp = *ptrI++; \
-   if (tmp) MarkObjectAlloc(tmp,__inCtx);
+   if (tmp) { \
+      HX_PREFETCH((char*)tmp - 4); \
+      MarkObjectAlloc(tmp,__inCtx); \
+   }
 
 
 
@@ -4235,10 +4396,29 @@ public:
    }
 
 
+   void ClearRowMarksAsync(int inId)
+   {
+      while(!sgThreadPoolAbort)
+      {
+         int blockId = _hx_atomic_add(&mThreadJobId, 1);
+         if (blockId>=mAllBlocks.size())
+            break;
+
+         mAllBlocks[blockId]->clearRowMarks();
+      }
+   }
+
    void ClearRowMarks()
    {
-      for(int i=0;i<mAllBlocks.size();i++)
-         mAllBlocks[i]->clearRowMarks();
+      if (MAX_GC_THREADS>1 && mAllBlocks.size() > 64)
+      {
+         StartThreadJobs(tpjClearRowMarks, MAX_GC_THREADS, true);
+      }
+      else
+      {
+         for(int i=0;i<mAllBlocks.size();i++)
+            mAllBlocks[i]->clearRowMarks();
+      }
    }
 
 
@@ -4650,6 +4830,9 @@ public:
             else if (sgThreadPoolJob==tpjCleanWeakRefs)
                CleanWeakRefsAsync();
 
+            else if (sgThreadPoolJob==tpjClearRowMarks)
+               ClearRowMarksAsync(inId);
+
             finishThreadJob(inId);
          }
       }
@@ -4979,6 +5162,52 @@ public:
    }
    #endif
 
+   struct GCProfiler {
+      double startTime;
+      double lastTime;
+      const char* type;
+      bool active;
+
+      GCProfiler() : active(false), type("Unknown"), startTime(0), lastTime(0) {}
+
+      void Begin(const char* inType) {
+         active = true;
+         type = inType;
+         startTime = lastTime = __hxcpp_time_stamp();
+         #ifdef PROFILE_COLLECT
+         GCLOG("[GC] Start Type: %s\n", type);
+         #endif
+      }
+      
+      void SetType(const char* inType) {
+          type = inType;
+      }
+
+      void Step(const char* stepName) {
+         if (!active) return;
+         double now = __hxcpp_time_stamp();
+         double duration = (now - lastTime) * 1000.0;
+         #ifdef PROFILE_COLLECT
+         GCLOG("[GC] Type: %s, Step: %s, Time: %.3f ms\n", type, stepName, duration);
+         #endif
+         lastTime = now;
+      }
+
+      void End() {
+         if (!active) return;
+         double now = __hxcpp_time_stamp();
+         double total = (now - startTime) * 1000.0;
+         #ifdef PROFILE_COLLECT
+         GCLOG("[GC] End Type: %s, Total: %.3f ms\n", type, total);
+         #endif
+         active = false;
+      }
+      
+      ~GCProfiler() {
+          if (active) End();
+      }
+   };
+
    void Collect(bool inMajor, bool inForceCompact, bool inLocked,bool inFreeIsFragged)
    {
       PROFILE_COLLECT_SUMMARY_START;
@@ -5029,6 +5258,9 @@ public:
       #endif
 
       HX_STACK_FRAME("GC", "collect", 0, "GC::collect", __FILE__, __LINE__,0)
+      
+      GCProfiler profiler;
+
       #ifdef SHOW_MEM_EVENTS
       int here = 0;
       GCLOG("=== Collect === %p\n",&here);
@@ -5088,9 +5320,13 @@ public:
       }
       #endif
 
+      profiler.Begin(generational ? "Minor" : "Full");
+      profiler.Step("Setup");
+
       STAMP(t1)
 
       MarkAll(generational);
+      profiler.Step("Mark");
 
       #ifdef HX_GC_VERIFY_GENERATIONAL
       {
@@ -5151,7 +5387,9 @@ public:
             #endif
 
             generational = false;
+            profiler.SetType("Full (Fallback)");
             MarkAll(generational);
+            profiler.Step("Mark (Retry)");
 
             sgTimeToNextTableUpdate--;
             full = sgTimeToNextTableUpdate<=0;
@@ -5164,12 +5402,14 @@ public:
       {
          reclaimBlocks(full,stats);
       }
+      profiler.Step("Reclaim");
 
 
       #ifdef HXCPP_GC_GENERATIONAL
       if (compactSurviors)
       {
          MoveSurvivors(&rememberedSet);
+         profiler.Step("Compact Survivors");
       }
       #endif
 
@@ -5407,6 +5647,7 @@ public:
          }
       }
       #endif
+      profiler.Step("Defrag");
 
 
       STAMP(t5)
@@ -5510,10 +5751,20 @@ public:
       #endif
 
       #ifdef PROFILE_THREAD_USAGE
+      GCLOG("--- CONCURRENT GC VERIFICATION ---\n");
       GCLOG("Thread chunks:%d, wakes=%d\n", sThreadChunkPushCount, sThreadChunkWakes);
-      for(int i=-1;i<MAX_GC_THREADS;i++)
-        GCLOG(" thread %d] %d + %d\n", i, sThreadMarkCount[i], sThreadArrayMarkCount[i]);
+      int activeThreads = 0;
+      for(int i=-1;i<MAX_GC_THREADS;i++) {
+         if (sThreadMarkCount[i] > 0 || sThreadArrayMarkCount[i] > 0) {
+            GCLOG(" thread %d] Objects: %d + Arrays: %d\n", i, sThreadMarkCount[i], sThreadArrayMarkCount[i]);
+            if (i >= 0) activeThreads++;
+         }
+      }
+      if (activeThreads > 1) GCLOG("VERIFICATION SUCCESS: %d threads participated in marking.\n", activeThreads);
+      else GCLOG("VERIFICATION WARNING: Only %d thread(s) participated. Concurrency might be limited by workload size.\n", activeThreads);
+      
       GCLOG("Locking spins  : %d\n", sSpinCount);
+      GCLOG("----------------------------------\n");
       sSpinCount = 0;
       #endif
 
@@ -6408,11 +6659,11 @@ public:
       if (mGCFreeZone)
          CriticalGCError("Allocating from a GC-free thread");
       #endif
-      if (hx::gPauseForCollect)
+      if (HX_UNLIKELY(hx::gPauseForCollect))
          PauseForCollect();
       #endif
 
-      if (inSize==0)
+      if (HX_UNLIKELY(inSize==0))
          return hx::emptyAlloc;
 
       #if defined(HXCPP_VISIT_ALLOCS) && (defined(HXCPP_M64)||defined(HXCPP_ARM64))
@@ -6436,7 +6687,7 @@ public:
             #endif
             unsigned char *end = buffer + allocSize;
 
-            if ( end <= spaceOversize )
+            if ( HX_LIKELY(end <= spaceOversize) )
             {
                spaceFirst = end;
 
@@ -6460,7 +6711,7 @@ public:
             #endif
 
             int end = spaceStart + allocSize;
-            if (end <= spaceEnd)
+            if (HX_LIKELY(end <= spaceEnd))
             {
                unsigned int *buffer = (unsigned int *)(allocBase + spaceStart);
 
