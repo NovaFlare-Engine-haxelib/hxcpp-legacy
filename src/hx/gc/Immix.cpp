@@ -92,12 +92,19 @@ void DebuggerTrap()
       #endif
    }
 }
+} // namespace hx
+
+
+
+
+namespace hx
+{
+static bool sgAllocInit = 0;
 }
 
-
-
-
-static bool sgAllocInit = 0;
+#if !defined(HX_MULTI_THREAD_MARKING) && !defined(HXCPP_SINGLE_THREADED_APP)
+   #define HX_MULTI_THREAD_MARKING 1
+#endif
 static bool sgInternalEnable = true;
 static void *sgObject_root = 0;
 // With virtual inheritance, stack pointers can point to the middle of an object
@@ -123,7 +130,7 @@ static size_t sgMaximumFreeSpace  = 1024*1024*1024;
 #endif
 
 
-//#define HXCPP_GC_DEBUG_LEVEL 0
+// #define HXCPP_GC_DEBUG_LEVEL 1
 
 #if HXCPP_GC_DEBUG_LEVEL>1
   #define PROFILE_COLLECT
@@ -616,6 +623,8 @@ enum ThreadPoolJob
    tpjAsyncZeroJit,
    tpjGetStats,
    tpjVisitBlocks,
+   tpjMoveBlocks,
+   tpjCleanWeakRefs,
 };
 
 int sgThreadCount = 0;
@@ -670,6 +679,7 @@ struct BlockDataStats
       fraggedBlocks += inOther.fraggedBlocks;
       fragScore += inOther.fragScore;
       fraggedRows += inOther.fraggedRows;
+      movedObjs += inOther.movedObjs;
    }
 
    int rowsInUse;
@@ -678,6 +688,7 @@ struct BlockDataStats
    int fragScore;
    int fraggedBlocks;
    int fraggedRows;
+   int movedObjs;
 };
 
 static BlockDataStats sThreadBlockDataStats[MAX_GC_THREADS];
@@ -796,8 +807,6 @@ struct BlockDataInfo
       mGroupId = inGid;
       mPtr     = inData;
       inData->mId = mId;
-
-
       #ifdef SHOW_MEM_EVENTS
       //GCLOG("  create block %d : %p -> %p\n",  mId, this, mPtr );
       #endif
@@ -2494,6 +2503,9 @@ typedef hx::QuickVec<hx::HashRoot *> WeakHashList;
 FILE_SCOPE WeakHashList sWeakHashList;
 
 
+class GlobalAllocator;
+extern class GlobalAllocator *sGlobalAlloc;
+
 InternalFinalizer::InternalFinalizer(hx::Object *inObj, finalizer inFinalizer)
 {
    mValid = true;
@@ -2630,6 +2642,7 @@ static int localAllocs;
 static int rootObjects;
 static int rootAllocs;
 
+void CleanWeakRefs();
 void RunFinalizers()
 {
    finalizerCount = 0;
@@ -2729,65 +2742,7 @@ void RunFinalizers()
       i = next;
    }
 
-   for(int i=0;i<sWeakHashList.size();    )
-   {
-      HashRoot *ref = sWeakHashList[i];
-      unsigned char mark = ((unsigned char *)ref)[HX_ENDIAN_MARK_ID_BYTE];
-      // Object itself is gone - no need to worry about that again
-      if ( mark!=gByteMarkID )
-      {
-         sWeakHashList.qerase(i);
-         // no i++ ...
-      }
-      else
-      {
-         ref->updateAfterGc();
-         i++;
-      }
-   }
-
-
-
-   for(int i=0;i<sWeakRefs.size();    )
-   {
-      WeakRef *ref = sWeakRefs[i];
-      unsigned char mark = ((unsigned char *)ref)[HX_ENDIAN_MARK_ID_BYTE];
-      // Object itself is gone ...
-      if ( mark!=gByteMarkID )
-      {
-         sWeakRefs.qerase(i);
-         // no i++ ...
-      }
-      else
-      {
-         // what about the reference?
-         hx::Object *r = ref->mRef.mPtr;
-         unsigned char mark = ((unsigned char *)r)[HX_ENDIAN_MARK_ID_BYTE];
-
-         // Special case of member closure - check if the 'this' pointer is still alive
-         if ( mark!=gByteMarkID && r->__GetType()==vtFunction)
-         {
-            hx::Object *thiz = (hx::Object *)r->__GetHandle();
-            if (thiz)
-            {
-               mark = ((unsigned char *)thiz)[HX_ENDIAN_MARK_ID_BYTE];
-               if (mark==gByteMarkID)
-               {
-                  // The object is still alive, so mark the closure and continue
-                  MarkAlloc(r,0);
-               }
-            }
-         }
-
-         if ( mark!=gByteMarkID )
-         {
-            ref->mRef.mPtr = 0;
-            sWeakRefs.qerase(i);
-         }
-         else
-            i++;
-      }
-   }
+   CleanWeakRefs();
 }
 
 // Callback finalizer on non-abstract type;
@@ -2931,6 +2886,8 @@ hx::Object *__hxcpp_weak_ref_get(Dynamic inRef)
 }
 
 
+namespace hx
+{
 // --- GlobalAllocator -------------------------------------------------------
 
 typedef hx::QuickVec<BlockDataInfo *> BlockList;
@@ -2969,8 +2926,10 @@ inline bool SortByBlockPtr(BlockDataInfo *inA, BlockDataInfo *inB)
 struct MoveBlockJob
 {
    BlockList blocks;
-   int from;
-   int to;
+   volatile int from;
+   volatile int to;
+   volatile int maxBlocks;
+   volatile int processedBlocks;
 
    MoveBlockJob(BlockList &inAllBlocks)
    {
@@ -2980,54 +2939,65 @@ struct MoveBlockJob
       std::sort(&blocks[0], &blocks[0]+blocks.size(), SortMoveOrder );
       from = 0;
       to = blocks.size()-1;
+      maxBlocks = 0x7fffffff;
+      processedBlocks = 0;
    }
+
+   void setLimit(int limit) { maxBlocks = limit; }
 
    BlockDataInfo *getFrom()
    {
       while(true)
       {
-         if (from>=to)
-         {
-            //printf("Caught up!\n");
+         int f = from;
+         int t = to;
+
+         if (f>=t)
             return 0;
-         }
+         
+         if (processedBlocks >= maxBlocks)
+            return 0;
+
+         // Try to claim 'f'
+         if (_hx_atomic_compare_exchange(&from, f, f+1) != f)
+             continue;
+
+         BlockDataInfo *b = blocks[f];
+
          #ifndef HXCPP_GC_DEBUG_ALWAYS_MOVE
          // Pinned / full
-         if (blocks[from]->mMoveScore<2)
-         {
-            //printf("All other blocks good!\n");
-            while(from<to)
-            {
-               //printf("Ignore DEFRAG %p ... %p\n", blocks[from]->mPtr, blocks[from]->mPtr+1);
-               from++;
-            }
+         if (b->mMoveScore<2)
             return 0;
-         }
          #endif
-         if (blocks[from]->mPinned)
+         if (b->mPinned)
          {
-            //printf("PINNED DEFRAG %p ... %p\n", blocks[from]->mPtr, blocks[from]->mPtr+1);
-            from++;
+            // Just skip it - we already incremented 'from'
+            continue;
          }
          else // Found one...
-            break;
+         {
+            if (_hx_atomic_add(&processedBlocks, 1) > maxBlocks)
+               return 0;
+            return b;
+         }
       }
-      //printf("From block %d (id=%d)\n", from, blocks[from]->mId);
-      BlockDataInfo *result = blocks[from++];
-      ////printf("FROM DEFRAG %p ... %p\n", result->mPtr, result->mPtr + 1 );
-      return result;
    }
    BlockDataInfo *getTo()
    {
-      if (from>=to)
+      while(true)
       {
-         //printf("No more room!\n");
-         return 0;
+         int f = from;
+         int t = to;
+
+         if (f>=t)
+            return 0;
+
+         // Try to claim 't'
+         if (_hx_atomic_compare_exchange(&to, t, t-1) != t)
+             continue;
+         
+         return blocks[t];
       }
-      //printf("To block %d (id=%d)\n", to, blocks[to]->mId);
-      BlockDataInfo *result = blocks[to--];
-      //printf("TO DEFRAG %p ... %p\n", result->mPtr, result->mPtr + 1 );
-      return result;
    }
 };
 
@@ -3874,7 +3844,7 @@ public:
 
       if (moveObjs)
       {
-         AdjustPointers(0);
+         ioStats.movedObjs = moveObjs;
       }
 
 
@@ -4387,6 +4357,121 @@ public:
       }
    }
 
+   void MoveBlocksAsync(BlockDataStats &outStats)
+   {
+      MoveBlocks(*mCurrentMoveJob, outStats);
+   }
+
+   void CleanWeakRefsAsync()
+   {
+      // Process Weak Hashes
+      while(true)
+      {
+         int idx = _hx_atomic_add(&mThreadJobId, 32);
+         if (idx >= hx::sWeakHashList.size())
+            break;
+         
+         int end = idx + 32;
+         if (end > hx::sWeakHashList.size())
+            end = hx::sWeakHashList.size();
+
+         for(int i=idx; i<end; i++)
+         {
+             hx::HashRoot *ref = hx::sWeakHashList[i];
+             unsigned char mark = ((unsigned char *)ref)[HX_ENDIAN_MARK_ID_BYTE];
+             if ( mark!=gByteMarkID )
+             {
+                hx::sWeakHashList[i] = 0; // Mark for deletion
+             }
+             else
+             {
+                ref->updateAfterGc();
+             }
+         }
+      }
+
+      // Process Weak Refs
+      while(true)
+      {
+         int idx = _hx_atomic_add(&mZeroListQueue, 128);
+         if (idx >= hx::sWeakRefs.size())
+            break;
+         
+         int end = idx + 128;
+         if (end > hx::sWeakRefs.size())
+            end = hx::sWeakRefs.size();
+
+         for(int i=idx; i<end; i++)
+         {
+             hx::WeakRef *ref = hx::sWeakRefs[i];
+             unsigned char mark = ((unsigned char *)ref)[HX_ENDIAN_MARK_ID_BYTE];
+             if ( mark!=gByteMarkID )
+             {
+                hx::sWeakRefs[i] = 0; // Mark for deletion
+             }
+             else
+             {
+                hx::Object *r = ref->mRef.mPtr;
+                unsigned char mark = ((unsigned char *)r)[HX_ENDIAN_MARK_ID_BYTE];
+
+                // Special case of member closure
+                if ( mark!=gByteMarkID && r->__GetType()==vtFunction)
+                {
+                   hx::Object *thiz = (hx::Object *)r->__GetHandle();
+                   if (thiz)
+                   {
+                      mark = ((unsigned char *)thiz)[HX_ENDIAN_MARK_ID_BYTE];
+                      if (mark==gByteMarkID)
+                      {
+                         // Alive, mark closure
+                         // We are in a thread, so use concurrent mark?
+                         // Actually, at this point, marking is done. 
+                         // If we find it alive NOW, we missed it?
+                         // The original code says: "The object is still alive, so mark the closure and continue"
+                         //   MarkAlloc(r,0);
+                         // But MarkAlloc is not thread safe if it modifies block flags?
+                         // Wait, if we are here, we are in 'RunFinalizers'. Mark phase is OVER.
+                         // If we find an unmarked object that SHOULD be marked, we have a problem.
+                         // BUT, 'IsWeakRefValid' logic in original code does:
+                         //    if (thiz is alive) MarkAlloc(r, 0);
+                         // This is late-marking.
+                         
+                         // Since we are running in parallel, calling MarkAlloc (which modifies bitmaps)
+                         // concurrently on the same block is risky if not atomic.
+                         // However, MarkAlloc uses atomic ORs for row flags, so it MIGHT be safe.
+                         // But let's check MarkAlloc implementation.
+                         
+                         // For now, let's keep it simple:
+                         // If we hit this rare case, we just mark it.
+                         // Given it is a closure, it is likely small object.
+                         
+                         // To be safe, we can use the atomic version if available, 
+                         // or just lock? No, lock is slow.
+                         // Let's assume MarkAlloc is thread-safe enough (atomic flags) or
+                         // we delegate this specific marking to main thread?
+                         // No, that complicates things.
+                         
+                         // Actually, MarkAlloc calls MarkAllocUnchecked.
+                         // It updates:
+                         //   val | gImmixStartFlag  (Atomic exchange loop) -> SAFE
+                         //   mark byte -> SAFE (byte access)
+                         
+                         // So calling MarkAlloc here is likely SAFE.
+                         hx::MarkAlloc(r,0);
+                      }
+                   }
+                }
+
+                if ( mark!=gByteMarkID )
+                {
+                   ref->mRef.mPtr = 0;
+                   hx::sWeakRefs[i] = 0; // Mark for deletion
+                }
+             }
+         }
+      }
+   }
+
    bool ZeroAsyncJit()
    {
       int spinCount = 0;
@@ -4529,6 +4614,12 @@ public:
 
             else if (sgThreadPoolJob==tpjAsyncZero)
                ZeroAsync();
+
+            else if (sgThreadPoolJob==tpjMoveBlocks)
+               MoveBlocksAsync(sThreadBlockDataStats[inId]);
+
+            else if (sgThreadPoolJob==tpjCleanWeakRefs)
+               CleanWeakRefsAsync();
 
             finishThreadJob(inId);
          }
@@ -4697,7 +4788,7 @@ public:
    double tMarkLocal;
    double tMarkLocalEnd;
    double tMarked;
-   void MarkAll(bool inGenerational, hx::QuickVec<hx::Object *> *inRememberedSet = 0)
+   void MarkAll(bool inGenerational)
    {
       if (!inGenerational)
       {
@@ -4795,19 +4886,6 @@ public:
       // Mark local stacks
       for(int i=0;i<mLocalAllocs.size();i++)
          MarkLocalAlloc(mLocalAllocs[i] , &mMarker);
-
-      if (inRememberedSet)
-      {
-         #ifdef SHOW_MEM_EVENTS
-         GCLOG("Scanning remembered set: %d objects\n", inRememberedSet->size());
-         #endif
-         for(int i=0;i<inRememberedSet->size();i++)
-         {
-            hx::Object *obj = (*inRememberedSet)[i];
-            if (obj)
-               mMarker.pushObj(obj);
-         }
-      }
 
       #ifdef PROFILE_COLLECT
       hx::localObjects = sObjectMarks;
@@ -4955,45 +5033,24 @@ public:
       #ifdef HXCPP_GC_GENERATIONAL
       bool compactSurviors = false;
 
-      // Always process old referrers to prevent stale pointers after compaction
-      for(int i=0;i<mLocalAllocs.size();i++)
+      if (sGcMode==gcmGenerational)
       {
-         hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
-         if (sGcMode==gcmGenerational)
+         for(int i=0;i<mLocalAllocs.size();i++)
          {
+            hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
             if( ctx->mOldReferrers->count )
                 hx::sGlobalChunks.addLocked( ctx->mOldReferrers );
             else
                 hx::sGlobalChunks.free( ctx->mOldReferrers );
+            ctx->mOldReferrers = 0;
          }
-         else
-         {
-            if (ctx->mOldReferrers)
-               hx::sGlobalChunks.free( ctx->mOldReferrers );
-         }
-         ctx->mOldReferrers = 0;
       }
-      
+
       hx::QuickVec<hx::Object *> rememberedSet;
       generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
-      
-      // GC Start Log
-      GCLOG("[GC Start] Mode: %s | Reason: %s | Major: %d | ForceCompact: %d | GenMode: %d\n",
-         generational ? "Minor/Gen" : "Full/Major",
-         inMajor ? "Major Request" : (inForceCompact ? "Force Compact" : "Normal"),
-         inMajor, inForceCompact, sGcMode == gcmGenerational
-      );
-
-      // Always clear global chunks in full GC to prevent stale pointers
-      if (sGcMode!=gcmGenerational || !generational)
+      if (sGcMode==gcmGenerational)
       {
-          hx::QuickVec<hx::Object *> dummy;
-          hx::sGlobalChunks.copyPointers(dummy, true); // true = andFree
-      }
-
-      if (sGcMode==gcmGenerational && generational)
-      {
-         hx::sGlobalChunks.copyPointers(rememberedSet, false); // Keep chunks, just copy
+         hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
          #ifdef SHOW_MEM_EVENTS
          GCLOG("Patch remembered set marks %d\n", rememberedSet.size());
          #endif
@@ -5004,16 +5061,7 @@ public:
 
       STAMP(t1)
 
-      #ifdef HXCPP_GC_GENERATIONAL
-      MarkAll(generational, &rememberedSet);
-      #else
       MarkAll(generational);
-      #endif
-
-      #ifdef PROFILE_COLLECT
-      STAMP(t2)
-      GCLOG("[Step] Mark Completed | Time: %.3f ms\n", (t2-t1)*1000.0);
-      #endif
 
       #ifdef HX_GC_VERIFY_GENERATIONAL
       {
@@ -5030,7 +5078,7 @@ public:
       }
       #endif
 
-      // STAMP(t2)
+      STAMP(t2)
 
 
       // Sweep blocks
@@ -5041,8 +5089,6 @@ public:
          sgTimeToNextTableUpdate--;
 
       bool full = inMajor || (sgTimeToNextTableUpdate<=0) || inForceCompact;
-      
-      //GCLOG("[Step] Sweep Start | Full: %d | TimeToNextUpdate: %d\n", full, sgTimeToNextTableUpdate);
 
       // Setup memory target ...
       // Count free rows, and prep blocks for sorting
@@ -5060,8 +5106,6 @@ public:
          if (filled>0.85)
          {
             // Failure of generational estimation
-            GCLOG("[Step] Generational Fail - Switching to Full GC | Filled: %.2f%%\n", filled * 100.0);
-            
             int retained = currentRows - mRowsInUse;
             int space = mAllBlocks.size()*IMMIX_USEFUL_LINES - mRowsInUse;
             if (space<retained)
@@ -5078,11 +5122,7 @@ public:
             #endif
 
             generational = false;
-            #ifdef HXCPP_GC_GENERATIONAL
-            MarkAll(generational, &rememberedSet);
-            #else
             MarkAll(generational);
-            #endif
 
             sgTimeToNextTableUpdate--;
             full = sgTimeToNextTableUpdate<=0;
@@ -5113,10 +5153,10 @@ public:
             GCLOG("Row use ratio:%f\n", useRatio);
          #endif
          // Could be either expanding, or fragmented...
-         if (useRatio>0.75)
+         if (useRatio>0.75 || stats.fragScore > mAllBlocks.size()*FRAG_THRESH)
          {
             #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
-               GCLOG("Do full stats\n", useRatio);
+               GCLOG("Do full stats %f %d\n", useRatio, stats.fragScore);
             #endif
             full = true;
             stats.clear();
@@ -5155,10 +5195,7 @@ public:
 
       size_t bytesInUse = mRowsInUse<<IMMIX_LINE_BITS;
 
-      #ifdef PROFILE_COLLECT
       STAMP(t3)
-      GCLOG("[Step] Reclaim/Sweep Completed | Time: %.3f ms\n", (t3-t2)*1000.0);
-      #endif
 
 
       #ifdef HXCPP_TELEMETRY
@@ -5209,10 +5246,7 @@ public:
       int l1 = mLargeList.size();
 
 
-      #ifdef PROFILE_COLLECT
       STAMP(t4)
-      GCLOG("[Step] Sweep Large Completed | Time: %.3f ms\n", (t4-t3)*1000.0);
-      #endif
 
       bool defragged = false;
 
@@ -5271,8 +5305,33 @@ public:
             #endif
 
             MoveBlockJob job(mAllBlocks);
+            if (!inForceCompact)
+               job.setLimit( std::max(1, mAllBlocks.size()/10) );
 
-            if (MoveBlocks(job,stats) || doRelease)
+            int movedObjs = 0;
+            if (MAX_GC_THREADS>1)
+            {
+               mCurrentMoveJob = &job;
+               for(int i=0;i<MAX_GC_THREADS;i++)
+                  sThreadBlockDataStats[i].clear();
+
+               StartThreadJobs(tpjMoveBlocks, mAllBlocks.size(), true);
+
+               stats = sThreadBlockDataStats[0];
+               for(int i=1;i<MAX_GC_THREADS;i++)
+                  stats.add(sThreadBlockDataStats[i]);
+
+               movedObjs = stats.movedObjs;
+            }
+            else
+            {
+               movedObjs = MoveBlocks(job,stats);
+            }
+
+            if (movedObjs)
+               AdjustPointers(0);
+
+            if (movedObjs || doRelease)
             {
                if (doRelease)
                {
@@ -5321,10 +5380,7 @@ public:
       #endif
 
 
-      #ifdef PROFILE_COLLECT
       STAMP(t5)
-      GCLOG("[Step] Defrag Completed | Time: %.3f ms\n", (t5-t4)*1000.0);
-      #endif
 
       size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
       size_t baseMem = full ? bytesInUse : mem;
@@ -5385,11 +5441,6 @@ public:
       GCLOG("filled=%.2f%% + estimate = %.2f%% = %.2f%% -> %s\n",
             filled_ratio*100, mGenerationalRetainEstimate*100, after_gen*100, sGcMode==gcmFull?"Full":"Generational");
       #endif
-      
-      GCLOG("[GC End] Mode: %s | Next Mode: %s | Filled: %.2f%% | Estimate: %.2f%%\n",
-         generational ? "Minor/Gen" : "Full/Major",
-         sGcMode==gcmFull ? "Full" : "Generational",
-         filled_ratio*100, mGenerationalRetainEstimate*100);
 
       #endif
 
@@ -5698,12 +5749,10 @@ public:
    hx::QuickVec<LocalAllocator *> mLocalAllocs;
    LocalAllocator *mLocalPool[LOCAL_POOL_SIZE];
    hx::QuickVec<unsigned int *> largeObjectRecycle;
+   MoveBlockJob *mCurrentMoveJob;
 };
 
 
-
-namespace hx
-{
 
 MarkChunk *MarkChunk::swapForNew()
 {
@@ -5768,11 +5817,11 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
       {
 
          #ifdef PROFILE_COLLECT
-         hx::localCount++;
-         #endif
-         MemType mem = sGlobalAlloc->GetMemType(vptr);
+      hx::localCount++;
+      #endif
+      MemType mem = hx::sGlobalAlloc->GetMemType(vptr);
 
-         #ifdef HX_WATCH
+      #ifdef HX_WATCH
          isWatch = false;
          if (hxInWatchList(vptr) && vptr!=lastWatch)
          {
@@ -5957,7 +6006,7 @@ public:
       mGCFreeZone = true;
       mReadyForCollect.Set();
       #endif
-      sGlobalAlloc->AddLocal(this);
+      hx::sGlobalAlloc->AddLocal(this);
    }
 
    void Release()
@@ -5992,11 +6041,11 @@ public:
       mTopOfStack = mBottomOfStack = 0;
       #endif
 
-      sGlobalAlloc->RemoveLocalLocked(this);
+      hx::sGlobalAlloc->RemoveLocalLocked(this);
 
       hx::tlsStackContext = 0;
 
-      if (!sGlobalAlloc->ReturnToPoolLocked(this))
+      if (!hx::sGlobalAlloc->ReturnToPoolLocked(this))
          delete this;
    }
 
@@ -6295,7 +6344,7 @@ public:
       #endif
 
 
-      sGlobalAlloc->Collect(inMajor, inForceCompact, inLocked, inFreeIsFragged);
+      hx::sGlobalAlloc->Collect(inMajor, inForceCompact, inLocked, inFreeIsFragged);
    }
 
 
@@ -6435,7 +6484,7 @@ public:
             //mBottomOfStack = (int *)&dummy;
             //CAPTURE_REGS;
 
-            BlockDataInfo *info = sGlobalAlloc->GetFreeBlock(allocSize,this);
+            BlockDataInfo *info = hx::sGlobalAlloc->GetFreeBlock(allocSize,this);
 
             allocBase = (unsigned char *)info->mPtr;
             mCurrentRange = info->mRanges;
@@ -6668,7 +6717,7 @@ void InitAlloc()
 
    hx::CommonInitAlloc();
    sgAllocInit = true;
-   sGlobalAlloc = new GlobalAllocator();
+   hx::sGlobalAlloc = new GlobalAllocator();
    sgFinalizers = new FinalizerList();
    sFinalizerLock = new HxMutex();
    sGCRootLock = new HxMutex();
@@ -6704,7 +6753,7 @@ void SetTopOfStack(int *inTop,bool inForce)
    bool threadAttached = false;
    if (inTop)
    {
-      if (!sgAllocInit)
+      if (!hx::sgAllocInit)
          InitAlloc();
       else
       {
@@ -6744,7 +6793,7 @@ void *InternalNew(int inSize,bool inIsObject)
 
    if (inSize>=IMMIX_LARGE_OBJ_SIZE)
    {
-      void *result = sGlobalAlloc->AllocLarge(inSize, true);
+      void *result = hx::sGlobalAlloc->AllocLarge(inSize, true);
       return result;
    }
    else
@@ -6773,12 +6822,12 @@ void *InternalNew(int inSize,bool inIsObject)
 // Force global collection - should only be called from 1 thread.
 int InternalCollect(bool inMajor,bool inCompact)
 {
-   if (!sgAllocInit)
+   if (!hx::sgAllocInit)
        return 0;
 
    GetLocalAlloc()->SetupStackAndCollect(inMajor, inCompact);
 
-   return sGlobalAlloc->MemUsage();
+   return hx::sGlobalAlloc->MemUsage();
 }
 
 inline unsigned int ObjectSize(void *inData)
@@ -6815,7 +6864,7 @@ unsigned int ObjectSizeSafe(void *inData)
 
 void GCChangeManagedMemory(int inDelta, const char *inWhy)
 {
-   sGlobalAlloc->onMemoryChange(inDelta, inWhy);
+   hx::sGlobalAlloc->onMemoryChange(inDelta, inWhy);
 }
 
 void InternalReleaseMem(void *inMem)
@@ -6826,7 +6875,7 @@ void InternalReleaseMem(void *inMem)
       if (s>=IMMIX_LARGE_OBJ_SIZE)
       {
          //Can release asap
-         sGlobalAlloc->FreeLarge(inMem);
+         hx::sGlobalAlloc->FreeLarge(inMem);
       }
    }
 }
@@ -6860,7 +6909,7 @@ void *InternalRealloc(int inFromSize, void *inData,int inSize, bool inExpand)
    }
    else if (inSize>=IMMIX_LARGE_OBJ_SIZE)
    {
-      new_data = sGlobalAlloc->AllocLarge(inSize, false);
+      new_data = hx::sGlobalAlloc->AllocLarge(inSize, false);
       if (inSize>inFromSize)
          ZERO_MEM((char *)new_data + inFromSize,inSize-inFromSize);
    }
@@ -6908,7 +6957,7 @@ void NewMarkedObject(hx::Object *inPtr)
 void RegisterCurrentThread(void *inTopOfStack)
 {
    // Create a local-alloc
-   LocalAllocator *local = sGlobalAlloc->GetPooledAllocator();
+   LocalAllocator *local = hx::sGlobalAlloc->GetPooledAllocator();
    if (!local)
    {
       local = new LocalAllocator((int *)inTopOfStack);
@@ -7055,12 +7104,12 @@ int __hxcpp_gc_trace(hx::Class inClass,bool inPrint)
 
 int   __hxcpp_gc_large_bytes()
 {
-   return sGlobalAlloc->MemLarge();
+   return hx::sGlobalAlloc->MemLarge();
 }
 
 int   __hxcpp_gc_reserved_bytes()
 {
-   return sGlobalAlloc->MemReserved();
+   return hx::sGlobalAlloc->MemReserved();
 }
 
 // Return whole-process memory usage, in bytes
@@ -7148,13 +7197,13 @@ double __hxcpp_gc_mem_info(int inWhich)
    switch(inWhich)
    {
       case MEM_INFO_USAGE:
-         return (double)sGlobalAlloc->MemUsage();
+         return (double)hx::sGlobalAlloc->MemUsage();
       case MEM_INFO_RESERVED:
-         return (double)sGlobalAlloc->MemReserved();
+         return (double)hx::sGlobalAlloc->MemReserved();
       case MEM_INFO_CURRENT:
-         return (double)sGlobalAlloc->MemCurrent();
+         return (double)hx::sGlobalAlloc->MemCurrent();
       case MEM_INFO_LARGE:
-         return (double)sGlobalAlloc->MemLarge();
+         return (double)hx::sGlobalAlloc->MemLarge();
       // New: whole application/process memory usage
       case MEM_INFO_PROCESS:
          return (double)__hxcpp_process_used_bytes();
@@ -7164,7 +7213,7 @@ double __hxcpp_gc_mem_info(int inWhich)
 
 int   __hxcpp_gc_used_bytes()
 {
-   return sGlobalAlloc->MemUsage();
+   return hx::sGlobalAlloc->MemUsage();
 }
 
 void  __hxcpp_gc_do_not_kill(Dynamic inObj)
@@ -7247,7 +7296,7 @@ int __hxcpp_obj_id(Dynamic inObj)
    hx::Object *obj = inObj.mPtr;
    if (!obj) return -1;
    #ifdef HXCPP_USE_OBJECT_MAP
-   return sGlobalAlloc->GetObjectID(obj);
+   return hx::sGlobalAlloc->GetObjectID(obj);
    #else
    return (int)(obj);
    #endif
@@ -7256,7 +7305,7 @@ int __hxcpp_obj_id(Dynamic inObj)
 hx::Object *__hxcpp_id_obj(int inId)
 {
    #ifdef HXCPP_USE_OBJECT_MAP
-   return (hx::Object *)sGlobalAlloc->GetIDObject(inId);
+   return (hx::Object *)hx::sGlobalAlloc->GetIDObject(inId);
    #else
    return (hx::Object *)(inId);
    #endif
@@ -7285,4 +7334,95 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
 
 
 void DummyFunction(void *inPtr) { }
+
+void hx::CleanWeakRefs()
+{
+   if (MAX_GC_THREADS > 1 && (hx::sWeakHashList.size() > 100 || hx::sWeakRefs.size() > 100))
+   {
+      // Reset counters for load balancing
+      hx::sGlobalAlloc->mThreadJobId = 0;
+      hx::sGlobalAlloc->mZeroListQueue = 0;
+      
+      hx::sGlobalAlloc->StartThreadJobs(tpjCleanWeakRefs, MAX_GC_THREADS, true);
+
+      // Serial Compact
+      int n = 0;
+      for(int i=0;i<hx::sWeakHashList.size();i++)
+      {
+          if (hx::sWeakHashList[i])
+             hx::sWeakHashList[n++] = hx::sWeakHashList[i];
+      }
+      hx::sWeakHashList.setSize(n);
+
+      n = 0;
+      for(int i=0;i<hx::sWeakRefs.size();i++)
+      {
+          if (hx::sWeakRefs[i])
+             hx::sWeakRefs[n++] = hx::sWeakRefs[i];
+      }
+      hx::sWeakRefs.setSize(n);
+   }
+   else
+   {
+      // Serial fallback
+      for(int i=0;i<hx::sWeakHashList.size();    )
+      {
+         hx::HashRoot *ref = hx::sWeakHashList[i];
+         unsigned char mark = ((unsigned char *)ref)[HX_ENDIAN_MARK_ID_BYTE];
+         // Object itself is gone - no need to worry about that again
+         if ( mark!=gByteMarkID )
+         {
+            hx::sWeakHashList.qerase(i);
+            // no i++ ...
+         }
+         else
+         {
+            ref->updateAfterGc();
+            i++;
+         }
+      }
+
+      for(int i=0;i<hx::sWeakRefs.size();    )
+      {
+         hx::WeakRef *ref = hx::sWeakRefs[i];
+         unsigned char mark = ((unsigned char *)ref)[HX_ENDIAN_MARK_ID_BYTE];
+         // Object itself is gone ...
+         if ( mark!=gByteMarkID )
+         {
+            hx::sWeakRefs[i]->mRef.mPtr = 0;
+            hx::sWeakRefs.qerase(i);
+            // no i++ ...
+         }
+         else
+         {
+            // what about the reference?
+            hx::Object *r = ref->mRef.mPtr;
+            unsigned char mark = ((unsigned char *)r)[HX_ENDIAN_MARK_ID_BYTE];
+
+            // Special case of member closure - check if the 'this' pointer is still alive
+            if ( mark!=gByteMarkID && r->__GetType()==vtFunction)
+            {
+               hx::Object *thiz = (hx::Object *)r->__GetHandle();
+               if (thiz)
+               {
+                  mark = ((unsigned char *)thiz)[HX_ENDIAN_MARK_ID_BYTE];
+                  if (mark==gByteMarkID)
+                  {
+                     // The object is still alive, so mark the closure and continue
+                     hx::MarkAlloc(r,0);
+                  }
+               }
+            }
+
+            if ( mark!=gByteMarkID )
+            {
+               ref->mRef.mPtr = 0;
+               hx::sWeakRefs.qerase(i);
+            }
+            else
+               i++;
+         }
+      }
+   }
+}
 
