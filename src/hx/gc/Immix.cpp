@@ -123,7 +123,7 @@ static size_t sgMaximumFreeSpace  = 1024*1024*1024;
 #endif
 
 
-// #define HXCPP_GC_DEBUG_LEVEL 1
+//#define HXCPP_GC_DEBUG_LEVEL 0
 
 #if HXCPP_GC_DEBUG_LEVEL>1
   #define PROFILE_COLLECT
@@ -796,6 +796,8 @@ struct BlockDataInfo
       mGroupId = inGid;
       mPtr     = inData;
       inData->mId = mId;
+
+
       #ifdef SHOW_MEM_EVENTS
       //GCLOG("  create block %d : %p -> %p\n",  mId, this, mPtr );
       #endif
@@ -4796,6 +4798,9 @@ public:
 
       if (inRememberedSet)
       {
+         #ifdef SHOW_MEM_EVENTS
+         GCLOG("Scanning remembered set: %d objects\n", inRememberedSet->size());
+         #endif
          for(int i=0;i<inRememberedSet->size();i++)
          {
             hx::Object *obj = (*inRememberedSet)[i];
@@ -4950,24 +4955,45 @@ public:
       #ifdef HXCPP_GC_GENERATIONAL
       bool compactSurviors = false;
 
-      if (sGcMode==gcmGenerational)
+      // Always process old referrers to prevent stale pointers after compaction
+      for(int i=0;i<mLocalAllocs.size();i++)
       {
-         for(int i=0;i<mLocalAllocs.size();i++)
+         hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
+         if (sGcMode==gcmGenerational)
          {
-            hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
             if( ctx->mOldReferrers->count )
                 hx::sGlobalChunks.addLocked( ctx->mOldReferrers );
             else
                 hx::sGlobalChunks.free( ctx->mOldReferrers );
-            ctx->mOldReferrers = 0;
          }
+         else
+         {
+            if (ctx->mOldReferrers)
+               hx::sGlobalChunks.free( ctx->mOldReferrers );
+         }
+         ctx->mOldReferrers = 0;
       }
-
+      
       hx::QuickVec<hx::Object *> rememberedSet;
       generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
-      if (sGcMode==gcmGenerational)
+      
+      // GC Start Log
+      GCLOG("[GC Start] Mode: %s | Reason: %s | Major: %d | ForceCompact: %d | GenMode: %d\n",
+         generational ? "Minor/Gen" : "Full/Major",
+         inMajor ? "Major Request" : (inForceCompact ? "Force Compact" : "Normal"),
+         inMajor, inForceCompact, sGcMode == gcmGenerational
+      );
+
+      // Always clear global chunks in full GC to prevent stale pointers
+      if (sGcMode!=gcmGenerational || !generational)
       {
-         hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
+          hx::QuickVec<hx::Object *> dummy;
+          hx::sGlobalChunks.copyPointers(dummy, true); // true = andFree
+      }
+
+      if (sGcMode==gcmGenerational && generational)
+      {
+         hx::sGlobalChunks.copyPointers(rememberedSet, false); // Keep chunks, just copy
          #ifdef SHOW_MEM_EVENTS
          GCLOG("Patch remembered set marks %d\n", rememberedSet.size());
          #endif
@@ -4978,7 +5004,16 @@ public:
 
       STAMP(t1)
 
+      #ifdef HXCPP_GC_GENERATIONAL
       MarkAll(generational, &rememberedSet);
+      #else
+      MarkAll(generational);
+      #endif
+
+      #ifdef PROFILE_COLLECT
+      STAMP(t2)
+      GCLOG("[Step] Mark Completed | Time: %.3f ms\n", (t2-t1)*1000.0);
+      #endif
 
       #ifdef HX_GC_VERIFY_GENERATIONAL
       {
@@ -4995,7 +5030,7 @@ public:
       }
       #endif
 
-      STAMP(t2)
+      // STAMP(t2)
 
 
       // Sweep blocks
@@ -5006,6 +5041,8 @@ public:
          sgTimeToNextTableUpdate--;
 
       bool full = inMajor || (sgTimeToNextTableUpdate<=0) || inForceCompact;
+      
+      //GCLOG("[Step] Sweep Start | Full: %d | TimeToNextUpdate: %d\n", full, sgTimeToNextTableUpdate);
 
       // Setup memory target ...
       // Count free rows, and prep blocks for sorting
@@ -5023,6 +5060,8 @@ public:
          if (filled>0.85)
          {
             // Failure of generational estimation
+            GCLOG("[Step] Generational Fail - Switching to Full GC | Filled: %.2f%%\n", filled * 100.0);
+            
             int retained = currentRows - mRowsInUse;
             int space = mAllBlocks.size()*IMMIX_USEFUL_LINES - mRowsInUse;
             if (space<retained)
@@ -5039,7 +5078,11 @@ public:
             #endif
 
             generational = false;
+            #ifdef HXCPP_GC_GENERATIONAL
+            MarkAll(generational, &rememberedSet);
+            #else
             MarkAll(generational);
+            #endif
 
             sgTimeToNextTableUpdate--;
             full = sgTimeToNextTableUpdate<=0;
@@ -5112,7 +5155,10 @@ public:
 
       size_t bytesInUse = mRowsInUse<<IMMIX_LINE_BITS;
 
+      #ifdef PROFILE_COLLECT
       STAMP(t3)
+      GCLOG("[Step] Reclaim/Sweep Completed | Time: %.3f ms\n", (t3-t2)*1000.0);
+      #endif
 
 
       #ifdef HXCPP_TELEMETRY
@@ -5163,7 +5209,10 @@ public:
       int l1 = mLargeList.size();
 
 
+      #ifdef PROFILE_COLLECT
       STAMP(t4)
+      GCLOG("[Step] Sweep Large Completed | Time: %.3f ms\n", (t4-t3)*1000.0);
+      #endif
 
       bool defragged = false;
 
@@ -5272,7 +5321,10 @@ public:
       #endif
 
 
+      #ifdef PROFILE_COLLECT
       STAMP(t5)
+      GCLOG("[Step] Defrag Completed | Time: %.3f ms\n", (t5-t4)*1000.0);
+      #endif
 
       size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
       size_t baseMem = full ? bytesInUse : mem;
@@ -5333,6 +5385,11 @@ public:
       GCLOG("filled=%.2f%% + estimate = %.2f%% = %.2f%% -> %s\n",
             filled_ratio*100, mGenerationalRetainEstimate*100, after_gen*100, sGcMode==gcmFull?"Full":"Generational");
       #endif
+      
+      GCLOG("[GC End] Mode: %s | Next Mode: %s | Filled: %.2f%% | Estimate: %.2f%%\n",
+         generational ? "Minor/Gen" : "Full/Major",
+         sGcMode==gcmFull ? "Full" : "Generational",
+         filled_ratio*100, mGenerationalRetainEstimate*100);
 
       #endif
 
