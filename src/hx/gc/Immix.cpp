@@ -185,12 +185,12 @@ static size_t sgMaximumFreeSpace  = 1024*1024*1024;
 static size_t sgMaximumFreeSpace  = 1024*1024*1024;
 #endif
 
+//#define PROFILE_THREAD_USAGE
 
 //#define HXCPP_GC_DEBUG_LEVEL 0
 
 #if HXCPP_GC_DEBUG_LEVEL>1
   #define PROFILE_COLLECT
-  #define PROFILE_THREAD_USAGE
   #if HXCPP_GC_DEBUG_LEVEL>2
      #define SHOW_FRAGMENTATION
      #if HXCPP_GC_DEBUG_LEVEL>3
@@ -683,11 +683,7 @@ enum ThreadPoolJob
    tpjMoveBlocks,
    tpjCleanWeakRefs,
    tpjClearRowMarks,
-   tpjFinalize,
-   tpjMarkRoots,
 };
-
-static std::vector<hx::Object **> *sThreadRoots = 0;
 
 int sgThreadCount = 0;
 static ThreadPoolJob sgThreadPoolJob = tpjNone;
@@ -2839,7 +2835,7 @@ static int rootAllocs;
 void CleanWeakRefs();
 void RunFinalizers()
 {
-   // finalizerCount = 0; // Reset in MarkAll
+   finalizerCount = 0;
 
    FinalizerList &list = *sgFinalizers;
    int idx = 0;
@@ -2871,12 +2867,6 @@ void RunFinalizers()
    while(idx<sFinalizableList.size())
    {
       Finalizable &f = sFinalizableList[idx];
-      if (!f.base)
-      {
-         sFinalizableList.qerase(idx);
-         continue;
-      }
-
       unsigned char mark = ((unsigned char *)f.base)[HX_ENDIAN_MARK_ID_BYTE];
       if ( mark!=gByteMarkID )
       {
@@ -4805,85 +4795,7 @@ public:
 
          if (sgThreadPoolJob==tpjMark)
          {
-            // Distribute local stacks to threads
-            int nLocals = mLocalAllocs.size();
-            for(int i=inId; i<nLocals; i+=sgThreadCount)
-               MarkLocalAlloc(mLocalAllocs[i] , &context);
-
-            // Distribute zombies
-            int nZombies = hx::sZombieList.size();
-            for(int i=inId; i<nZombies; i+=sgThreadCount)
-               hx::MarkObjectAlloc(hx::sZombieList[i], &context);
- 
             context.processMarkStack();
-         }
-         else if (sgThreadPoolJob==tpjFinalize)
-         {
-             int localFinalizerCount = 0;
-
-             // 1. Process sgFinalizers
-             hx::FinalizerList &list = *hx::sgFinalizers;
-             int size = list.size();
-             int start = (size * inId) / sgThreadCount;
-             int end = (size * (inId + 1)) / sgThreadCount;
-             
-             for(int i=start; i<end; i++)
-             {
-                 hx::InternalFinalizer *f = list[i];
-                 if (f->mValid)
-                 {
-                    unsigned char mark = ((unsigned char *)(f->mObject))[HX_ENDIAN_MARK_ID_BYTE];
-                    if (mark != gByteMarkID)
-                    {
-                       if (f->mFinalizer)
-                       {
-                          f->mFinalizer(f->mObject);
-                          localFinalizerCount++;
-                       }
-                       // Mark as invalid so main thread cleans it up
-                       f->mValid = false;
-                    }
-                 }
-             }
-
-             // 2. Process sFinalizableList
-             int fsize = hx::sFinalizableList.size();
-             int fstart = (fsize * inId) / sgThreadCount;
-             int fend = (fsize * (inId + 1)) / sgThreadCount;
-
-             for(int i=fstart; i<fend; i++)
-             {
-                 hx::Finalizable &f = hx::sFinalizableList[i];
-                 if (f.base)
-                 {
-                    unsigned char mark = ((unsigned char *)f.base)[HX_ENDIAN_MARK_ID_BYTE];
-                    if (mark != gByteMarkID)
-                    {
-                       f.run();
-                       localFinalizerCount++;
-                       f.base = 0; // Mark as done
-                    }
-                 }
-             }
-
-             if (localFinalizerCount)
-                _hx_atomic_add(&hx::finalizerCount, localFinalizerCount);
-         }
-         else if (sgThreadPoolJob==tpjMarkRoots)
-         {
-             if (sThreadRoots)
-             {
-                 int size = sThreadRoots->size();
-                 int start = (size * inId) / sgThreadCount;
-                 int end = (size * (inId + 1)) / sgThreadCount;
-                 for(int i=start; i<end; i++)
-                 {
-                    hx::Object **obj = (*sThreadRoots)[i];
-                    if (*obj)
-                       hx::MarkObjectAlloc(*obj, &context);
-                 }
-                 context.processMarkStack();
-             }
          }
          else if (sgThreadPoolJob==tpjAsyncZeroJit)
          {
@@ -5088,9 +5000,6 @@ public:
    double tMarkLocal;
    double tMarkLocalEnd;
    double tMarked;
-   // Parallel root marking
-   std::vector<hx::Object **> mRootBuffer;
-
    void MarkAll(bool inGenerational)
    {
       if (!inGenerational)
@@ -5149,27 +5058,11 @@ public:
       {
       hx::AutoMarkPush info(&mMarker,"Roots","root");
 
-      #ifdef HX_MULTI_THREAD_MARKING
-      if (MAX_GC_THREADS>1 && sAllThreads)
-      {
-         mRootBuffer.clear();
-         mRootBuffer.reserve(hx::sgRootSet.size());
-         for(hx::RootSet::iterator i = hx::sgRootSet.begin(); i!=hx::sgRootSet.end(); ++i)
-             mRootBuffer.push_back(*i);
-         
-         sThreadRoots = &mRootBuffer;
-         StartThreadJobs(tpjMarkRoots, MAX_GC_THREADS, true);
-         sThreadRoots = 0;
-      }
-      else
-      #endif
-      {
       for(hx::RootSet::iterator i = hx::sgRootSet.begin(); i!=hx::sgRootSet.end(); ++i)
       {
          hx::Object *&obj = **i;
          if (obj)
             hx::MarkObjectAlloc(obj , &mMarker );
-      }
       }
 
       if (hx::sgOffsetRootSet)
@@ -5193,10 +5086,8 @@ public:
       {
       hx::AutoMarkPush info(&mMarker,"Zombies","zombie");
       // Mark zombies too....
-      #ifndef HX_MULTI_THREAD_MARKING
       for(int i=0;i<hx::sZombieList.size();i++)
          hx::MarkObjectAlloc(hx::sZombieList[i] , &mMarker );
-      #endif
       } // automark
 
       MEM_STAMP(tMarkLocal);
@@ -5205,10 +5096,8 @@ public:
       mMarker.isGenerational = inGenerational;
 
       // Mark local stacks
-      #ifndef HX_MULTI_THREAD_MARKING
       for(int i=0;i<mLocalAllocs.size();i++)
          MarkLocalAlloc(mLocalAllocs[i] , &mMarker);
-      #endif
 
       #ifdef PROFILE_COLLECT
       hx::localObjects = sObjectMarks;
@@ -5231,15 +5120,6 @@ public:
       MEM_STAMP(tMarked);
 
       hx::FindZombies(mMarker);
-      
-      hx::finalizerCount = 0;
-
-      #ifdef HX_MULTI_THREAD_MARKING
-      if (MAX_GC_THREADS>1 && sAllThreads)
-      {
-          StartThreadJobs(tpjFinalize, MAX_GC_THREADS, true);
-      }
-      #endif
 
       hx::RunFinalizers();
 
@@ -5866,9 +5746,6 @@ public:
               l0, l1, l2, (t4-t3)*1000, // large
               (t5-t4)*1000 // defrag
               );
-      GCLOG("  [Time Stamps] Start:%.3f Init:%.3f Loc:%.3f LocEnd:%.3f Marked:%.3f Final:%.3f End:%.3f\n",
-            (t1-t0)*1000, (tMarkInit-t0)*1000, (tMarkLocal-t0)*1000, (tMarkLocalEnd-t0)*1000, 
-            (tMarked-t0)*1000, (hx::tFinalizers-t0)*1000, (t2-t0)*1000);
       sObjectMarks = sAllocMarks = 0;
 
       #endif
