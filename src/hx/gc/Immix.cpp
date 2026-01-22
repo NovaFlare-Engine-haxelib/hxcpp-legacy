@@ -3214,7 +3214,8 @@ public:
          mLargeListLock.Lock();
          mLargeAllocated -= size;
          // Could somehow keep it in the list, but mark as recycled?
-         mLargeList.qerase_val(blob);
+         if (!mLargeList.qerase_val(blob))
+            mNurseryLargeObjects.qerase_val(blob);
          // We could maybe free anyhow?
          if (!largeObjectRecycle.hasExtraCapacity(1))
          {
@@ -3317,7 +3318,7 @@ public:
       if (do_lock && !isLocked)
          mLargeListLock.Lock();
 
-      mLargeList.push(result);
+      mNurseryLargeObjects.push(result);
       mLargeAllocated += inSize;
 
       if (do_lock)
@@ -3591,7 +3592,11 @@ public:
 
             // After zero/reclaim, it might be that the hole size is smaller than we thought.
             if (result->mMaxHoleSize>=inRequiredBytes)
+            {
+               AutoLock lock(mNurseryBlockLock);
+               mNurseryBlocks.push(result);
                return result;
+            }
 
             repoolReclaimedBlock(result);
             continue;
@@ -3662,7 +3667,11 @@ public:
 
          // After zero/reclaim, it might be that the hole size is smaller than we thought.
          if (result->mMaxHoleSize>=inRequiredBytes)
+         {
+            AutoLock lock(mNurseryBlockLock);
+            mNurseryBlocks.push(result);
             return result;
+         }
 
          repoolReclaimedBlock(result);
       }
@@ -5002,7 +5011,12 @@ public:
       // Count free rows, and prep blocks for sorting
       BlockDataStats stats;
 
-      reclaimBlocks(full,stats);
+      if (generational)
+         reclaimBlocks(full,stats,&mNurseryBlocks);
+      else
+         reclaimBlocks(full,stats);
+
+      mNurseryBlocks.clear();
 
 
       #ifdef HXCPP_GC_GENERATIONAL
@@ -5086,11 +5100,39 @@ public:
          recycleRemaining = mLargeAllocForceRefresh;
       #endif
 
-      int idx = 0;
-      int l0 = mLargeList.size();
-      while(idx<mLargeList.size())
+      int l0 = mLargeList.size() + mNurseryLargeObjects.size();
+
+      if (!generational)
       {
-         unsigned int *blob = mLargeList[idx];
+         int idx = 0;
+         while(idx<mLargeList.size())
+         {
+            unsigned int *blob = mLargeList[idx];
+            if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
+            {
+               unsigned int size = *blob;
+               mLargeAllocated -= size;
+               if (size < recycleRemaining)
+               {
+                  recycleRemaining -= size;
+                  largeObjectRecycle.push(blob);
+               }
+               else
+               {
+                  HxFree(blob);
+               }
+
+               mLargeList.qerase(idx);
+            }
+            else
+               idx++;
+         }
+      }
+
+      int idx = 0;
+      while(idx<mNurseryLargeObjects.size())
+      {
+         unsigned int *blob = mNurseryLargeObjects[idx];
          if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
          {
             unsigned int size = *blob;
@@ -5105,11 +5147,16 @@ public:
                HxFree(blob);
             }
 
-            mLargeList.qerase(idx);
+            mNurseryLargeObjects.qerase(idx);
          }
          else
-            idx++;
+         {
+             // Alive - promote
+             mLargeList.push(blob);
+             mNurseryLargeObjects.qerase(idx);
+         }
       }
+
 
       int l1 = mLargeList.size();
 
@@ -5382,9 +5429,21 @@ public:
       PROFILE_COLLECT_SUMMARY_END;
    }
 
-   void reclaimBlocks(bool full, BlockDataStats &outStats)
+   void reclaimBlocks(bool full, BlockDataStats &outStats, BlockList *inBlocks=0)
    {
-      if (MAX_GC_THREADS>1)
+      if (inBlocks || MAX_GC_THREADS<=1)
+      {
+         BlockList &blocks = inBlocks ? *inBlocks : mAllBlocks;
+         outStats.clear();
+         for(int i=0;i<blocks.size();i++)
+         {
+            if (full)
+               blocks[i]->reclaim<true>(&outStats);
+            else
+               blocks[i]->reclaim<false>(&outStats);
+         }
+      }
+      else
       {
          for(int i=0;i<MAX_GC_THREADS;i++)
             sThreadBlockDataStats[i].clear();
@@ -5392,17 +5451,6 @@ public:
          outStats = sThreadBlockDataStats[0];
          for(int i=1;i<MAX_GC_THREADS;i++)
             outStats.add(sThreadBlockDataStats[i]);
-      }
-      else
-      {
-         outStats.clear();
-         for(int i=0;i<mAllBlocks.size();i++)
-         {
-            if (full)
-               mAllBlocks[i]->reclaim<true>(&outStats);
-            else
-               mAllBlocks[i]->reclaim<false>(&outStats);
-         }
       }
    }
 
@@ -5564,6 +5612,13 @@ public:
             return memLarge;
       }
 
+      for(int i=0;i<mNurseryLargeObjects.size();i++)
+      {
+         unsigned int *blob = mNurseryLargeObjects[i] + 2;
+         if (blob==inPtr)
+            return memLarge;
+      }
+
       return memUnmanaged;
    }
 
@@ -5592,6 +5647,9 @@ public:
    hx::QuickVec<LocalAllocator *> mLocalAllocs;
    LocalAllocator *mLocalPool[LOCAL_POOL_SIZE];
    hx::QuickVec<unsigned int *> largeObjectRecycle;
+   BlockList mNurseryBlocks;
+   LargeList mNurseryLargeObjects;
+   HxMutex   mNurseryBlockLock;
 };
 
 
