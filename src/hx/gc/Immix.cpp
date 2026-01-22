@@ -4995,53 +4995,14 @@ public:
       if (!generational)
          sgTimeToNextTableUpdate--;
 
-      bool full = inMajor || (sgTimeToNextTableUpdate<=0) || inForceCompact;
+      // Remove the force full collection when sgTimeToNextTableUpdate <= 0 (Modified)
+      bool full = inMajor || inForceCompact;
 
       // Setup memory target ...
       // Count free rows, and prep blocks for sorting
       BlockDataStats stats;
 
-      /*
-       This reduces the stall time, but adds a bit of background cpu usage
-       Might be good to just countRows for non-generational too
-      */
-      if (!full && generational)
-      {
-         countRows(stats);
-         size_t currentRows = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
-         double filled = (double)(currentRows) / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
-         if (filled>0.85)
-         {
-            // Failure of generational estimation
-            int retained = currentRows - mRowsInUse;
-            int space = mAllBlocks.size()*IMMIX_USEFUL_LINES - mRowsInUse;
-            if (space<retained)
-               space = retained;
-            if (space<1)
-               space = 1;
-            mGenerationalRetainEstimate = (double)retained/(double)space;
-            #ifdef SHOW_MEM_EVENTS
-            GCLOG("Generational retention/fragmentation too high %f, do normal collect\n", mGenerationalRetainEstimate);
-            #endif
-
-            #ifdef HX_GC_VERIFY_ALLOC_START
-            verifyAllocStart();
-            #endif
-
-            generational = false;
-            MarkAll(generational);
-
-            sgTimeToNextTableUpdate--;
-            full = sgTimeToNextTableUpdate<=0;
-
-            stats.clear();
-            reclaimBlocks(full,stats);
-         }
-      }
-      else
-      {
-         reclaimBlocks(full,stats);
-      }
+      reclaimBlocks(full,stats);
 
 
       #ifdef HXCPP_GC_GENERATIONAL
