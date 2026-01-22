@@ -453,17 +453,26 @@ typedef ImmixAllocator Ctx;
 
 #ifdef HXCPP_GC_GENERATIONAL
   #define HX_OBJ_WB_CTX(obj,value,ctx) { \
-        unsigned char &mark =  ((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
-        if (mark == hx::gByteMarkID && value && !((unsigned char *)(value))[ HX_ENDIAN_MARK_ID_BYTE  ] ) { \
+         hx::Object *_obj = (hx::Object *)(obj); \
+         hx::Object *_val = (hx::Object *)(value); \
+         if (_obj && _val) { \
+            unsigned char &mark =  ((unsigned char *)(_obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
+            if (mark == hx::gByteMarkID && !((unsigned char *)(_val))[ HX_ENDIAN_MARK_ID_BYTE  ] ) { \
+                mark|=HX_GC_REMEMBERED; \
+                ctx->pushReferrer(_obj); \
+            } \
+         } \
+      }
+   #define HX_OBJ_WB_PESSIMISTIC_CTX(obj,ctx) { \
+      hx::Object *_obj = (hx::Object *)(obj); \
+      if (_obj) { \
+         unsigned char &mark =  ((unsigned char *)(_obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
+         if (mark == hx::gByteMarkID)  { \
             mark|=HX_GC_REMEMBERED; \
-            ctx->pushReferrer(obj); \
-     } }
-  #define HX_OBJ_WB_PESSIMISTIC_CTX(obj,ctx) { \
-     unsigned char &mark =  ((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
-     if (mark == hx::gByteMarkID)  { \
-        mark|=HX_GC_REMEMBERED; \
-        ctx->pushReferrer(obj); \
-     } }
+            ctx->pushReferrer(_obj); \
+         } \
+      } \
+      }
   // I'm not sure if this will ever trigger...
   #define HX_OBJ_WB_NEW_MARKED_OBJECT(obj) { \
      if (((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]==hx::gByteMarkID) hx::NewMarkedObject(obj); \

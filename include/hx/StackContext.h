@@ -362,7 +362,7 @@ enum
 
 struct MarkChunk
 {
-   enum { SIZE = 126 };
+   enum { SIZE = 62 };
    enum { OBJ_ARRAY_JOB = -1 };
 
    inline MarkChunk() : count(0), next(0) { }
