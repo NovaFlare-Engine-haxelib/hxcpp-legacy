@@ -1969,6 +1969,11 @@ public:
              hx::Object *obj = marking->pop();
              if (obj)
              {
+                if (marking->count)
+                {
+                   HX_PREFETCH(marking->stack[marking->count-1]);
+                }
+
                 ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE] = hx::gByteMarkID;
                 obj->__Mark(this);
                 #if HX_MULTI_THREAD_MARKING
@@ -2220,8 +2225,6 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
 
       if (flags & IMMIX_ALLOC_IS_CONTAINER)
       {
-         HX_PREFETCH(inPtr);
-
          #ifdef PROFILE_COLLECT
          sObjectMarks++;
          #endif
