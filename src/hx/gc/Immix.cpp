@@ -1623,6 +1623,18 @@ struct GlobalChunks
       }
    }
 
+   void freePointers()
+   {
+      while(processList)
+      {
+         MarkChunk *c = (MarkChunk *)processList;
+         processList = c->next;
+         c->count = 0;
+         c->next = (MarkChunk *)freeList;
+         freeList = c;
+      }
+   }
+
    int takeArrayJob(hx::Object **inPtr, int inLen)
    {
       if (sLazyThreads)
@@ -1948,6 +1960,7 @@ public:
              hx::Object *obj = marking->pop();
              if (obj)
              {
+                ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE] = hx::gByteMarkID;
                 obj->__Mark(this);
                 #if HX_MULTI_THREAD_MARKING
                 // Load balance
@@ -4966,12 +4979,19 @@ public:
       generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
       if (sGcMode==gcmGenerational)
       {
-         hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
-         #ifdef SHOW_MEM_EVENTS
-         GCLOG("Patch remembered set marks %d\n", rememberedSet.size());
-         #endif
-         for(int i=0;i<rememberedSet.size();i++)
-            ((unsigned char *)rememberedSet[i])[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+         if (compactSurviors)
+         {
+             hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
+             #ifdef SHOW_MEM_EVENTS
+             GCLOG("Patch remembered set marks %d\n", rememberedSet.size());
+             #endif
+             for(int i=0;i<rememberedSet.size();i++)
+                ((unsigned char *)rememberedSet[i])[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+         }
+         else if (!generational)
+         {
+             hx::sGlobalChunks.freePointers();
+         }
       }
       #endif
 
