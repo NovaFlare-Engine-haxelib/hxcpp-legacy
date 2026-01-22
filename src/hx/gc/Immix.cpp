@@ -17,6 +17,15 @@
 
 #include <string>
 #include <stdlib.h>
+
+#if defined(_MSC_VER) || defined(__SSE__)
+#include <xmmintrin.h>
+#define HX_PREFETCH(ptr) _mm_prefetch((const char *)(ptr), _MM_HINT_T0)
+#elif defined(__GNUC__) || defined(__clang__)
+#define HX_PREFETCH(ptr) __builtin_prefetch((const void *)(ptr), 0, 3)
+#else
+#define HX_PREFETCH(ptr)
+#endif
 #ifndef HX_WINDOWS
 #include <unistd.h>
 #endif
@@ -2211,6 +2220,8 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
 
       if (flags & IMMIX_ALLOC_IS_CONTAINER)
       {
+         HX_PREFETCH(inPtr);
+
          #ifdef PROFILE_COLLECT
          sObjectMarks++;
          #endif
