@@ -22,6 +22,14 @@
 #endif
 
 
+#ifdef _MSC_VER
+#include <xmmintrin.h>
+#define HX_PREFETCH(a) _mm_prefetch((char *)(a), _MM_HINT_T0)
+#else
+#define HX_PREFETCH(a) __builtin_prefetch(a)
+#endif
+
+
 static bool sgIsCollecting = false;
 
 namespace hx
@@ -1960,16 +1968,20 @@ public:
              hx::Object *obj = marking->pop();
              if (obj)
              {
+                if (marking->count)
+                   HX_PREFETCH(marking->stack[marking->count-1]);
+
                 ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE] = hx::gByteMarkID;
                 obj->__Mark(this);
                 #if HX_MULTI_THREAD_MARKING
                 // Load balance
-                if (sLazyThreads && marking->count>32)
+                if (sLazyThreads && marking->count > 128)
                 {
                    MarkChunk *c = sGlobalChunks.alloc();
-                   marking->count -= 16;
-                   c->count = 16;
-                   memcpy( c->stack, marking->stack + marking->count, 16*sizeof(hx::Object *));
+                   int n = 64;
+                   marking->count -= n;
+                   c->count = n;
+                   memcpy( c->stack, marking->stack + marking->count, n*sizeof(hx::Object *));
                    sGlobalChunks.pushJob(c,false);
                 }
                 #ifdef PROFILE_THREAD_USAGE
