@@ -17,15 +17,6 @@
 
 #include <string>
 #include <stdlib.h>
-
-#if defined(_MSC_VER) || defined(__SSE__)
-#include <xmmintrin.h>
-#define HX_PREFETCH(ptr) _mm_prefetch((const char *)(ptr), _MM_HINT_T0)
-#elif defined(__GNUC__) || defined(__clang__)
-#define HX_PREFETCH(ptr) __builtin_prefetch((const void *)(ptr), 0, 3)
-#else
-#define HX_PREFETCH(ptr)
-#endif
 #ifndef HX_WINDOWS
 #include <unistd.h>
 #endif
@@ -1969,11 +1960,6 @@ public:
              hx::Object *obj = marking->pop();
              if (obj)
              {
-                if (marking->count)
-                {
-                   HX_PREFETCH(marking->stack[marking->count-1]);
-                }
-
                 ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE] = hx::gByteMarkID;
                 obj->__Mark(this);
                 #if HX_MULTI_THREAD_MARKING
