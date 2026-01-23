@@ -473,8 +473,8 @@ extern void scriptMarkStack(hx::MarkContext *);
    #define IMMIX_BLOCK_BITS      16
    typedef unsigned int BlockIdType;
 #else
-   #define IMMIX_BLOCK_BITS      15
-   typedef unsigned short BlockIdType;
+   #define IMMIX_BLOCK_BITS      16
+   typedef unsigned int BlockIdType;
 #endif
 
 #define IMMIX_BLOCK_SIZE        (1<<IMMIX_BLOCK_BITS)
@@ -3141,7 +3141,7 @@ static int sMaxZeroQueueSize = 32;
 
 class GlobalAllocator
 {
-   enum { LOCAL_POOL_SIZE = 2 };
+   enum { LOCAL_POOL_SIZE = 16 };
 
 public:
    GlobalAllocator()
