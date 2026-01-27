@@ -4991,6 +4991,13 @@ public:
       generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
       if (sGcMode==gcmGenerational)
       {
+         if (generational && !compactSurviors)
+         {
+             hx::sGlobalChunks.copyPointers(rememberedSet,false);
+             for(int i=0;i<rememberedSet.size();i++)
+                ((unsigned char *)rememberedSet[i])[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+         }
+
          if (compactSurviors)
          {
              hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
